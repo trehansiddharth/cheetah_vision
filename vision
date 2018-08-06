@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+import numpy as np
+import quaternion
+import vision.transformation
+import collections
+import bisect
+import lcm
+from vision.state_estimate_t import state_estimate_t
+from vision.pose_t import pose_t
+import copy
+import time
+
+class Recorder:
+    def __init__(self, capacity):
+        self.ts = collections.deque(maxlen=capacity)
+        self.Ts = collections.deque(maxlen=capacity)
+        self.variances = collections.deque(maxlen=capacity)
+
+    def update(self, t, T, variance):
+        self.ts.append(t)
+        self.Ts.append(T)
+        self.variances.append(variance)
+
+    def measure_abs(self, at=None):
+        if len(self.ts) < 1:
+            raise ValueError
+        else:
+            if at is None:
+                i_at = len(self.ts) - 1
+            else:
+                i_at = bisect.bisect(self.ts, at)
+                i_at = min(i_at, len(self.ts) - 1)
+
+            t_at = self.ts[i_at]
+            T_at = self.Ts[i_at]
+            variance_at = self.variances[i_at]
+
+            return t_at, T_at, variance_at
+
+    def measure_diff(self, at=None, since=None):
+        t_since, T_since, variance_since = self.measure_abs(at=since)
+        t_at, T_at, variance_at = self.measure_abs(at=at)
+        T_diff = T_since.inverse() * T_at
+        variance_diff = variance_at - variance_since
+        return t_since, t_at, T_diff, variance_diff
+
+    def clear(since=None):
+        if since is None:
+            i_at = 0
+        else:
+            i_at = bisect.bisect(self.ts, since)
+        self.ts = self.ts[i_at:]
+        self.Ts = self.Ts[i_at:]
+        self.variances = self.variances[i_at:]
+
+    def history(self):
+        Ts = [vision.transformation.from_array(arr) for arr in self.Ts]
+        return self.ts.__array__(), Ts, self.variances.__array__()
+    
+    def __len__(self):
+        return len(self.ts)
+
+def measure_update(abs_recorder, diff_recorder, t):
+    t_abs, T_abs, variance_abs = abs_recorder.measure_abs(at=t)
+    _, _, T_diff, variance_diff = diff_recorder.measure_diff(at=t, since=t_abs)
+    return t, T_abs * T_diff, variance_abs + variance_diff
+
+def fuse_measurements(t, Ts, variances):
+    n = len(Ts)
+    A = np.block([[2 * np.diag(variances), np.ones((n, 1))],
+        [np.ones((1, n)), 0]])
+    b = np.block([[np.zeros((n, 1))], [1]])
+    x = np.linalg.inv(A) @ b
+    if np.isnan(np.sum(x[:-1])):
+        print(A)
+        print(b)
+        print(x)
+        raise ValueError
+    t_fused = t
+    T_fused = vision.transformation.slerp(Ts, x[:-1])
+    variance_fused = np.sum((x[:-1] ** 2) * (np.array(variances) ** 2))
+    return t_fused, T_fused, variance_fused
+
+if __name__ == "__main__":
+    realsense_recorder = Recorder(1000)
+    cheetah_recorder = Recorder(1000)
+    fused_recorder = Recorder(1000)
+
+    realsense_basis = vision.transformation.Transformation(
+        q = quaternion.from_float_array([0.4784, 0.5158, 0.5264, 0.4790]),
+        t = np.array([0.4041, -0.0778, -0.0698]))
+    realsense_ref = None
+    def fuse_poses(t_cheetah, T_cheetah, variance_cheetah, msg):
+        if len(realsense_recorder) == 0:
+            fused_vars = t_cheetah, T_cheetah, variance_cheetah
+        else:
+            _, T_abs, variance_abs = measure_update(realsense_recorder,
+                cheetah_recorder, t_cheetah)
+            if len(fused_recorder) == 0:
+                fused_vars = t_cheetah, T_abs, variance_abs
+            else:
+                _, T_predict, variance_predict = measure_update(fused_recorder,
+                    cheetah_recorder, t_cheetah)
+                fused_vars = fuse_measurements(t_cheetah, [T_predict, T_abs],
+                    [variance_predict, variance_abs])
+        fused_recorder.update(*fused_vars)
+        arr = fused_vars[1].as_array()
+        msg.quat = arr[:4]
+        msg.p0 = arr[4:]
+        node.publish("CHEETAH_state_estimate_fused", msg.encode())
+
+    def handle_realsense(channel, data):
+        t = time.time() - 0.2
+        msg = pose_t.decode(data)
+        T = vision.transformation.Transformation(
+            q = quaternion.from_float_array(msg.orientation),
+            t = np.array(msg.position))
+        T = T.inverse()
+        T.t = 5.2 * T.t
+        variance = 0.025
+        realsense_recorder.update(t, T, variance)
+    
+    cheetah_prev_t = None
+    cheetah_prev_variance = 0
+    def handle_cheetah(channel, data):
+        global cheetah_prev_t
+        global cheetah_prev_variance
+        global realsense_ref
+        t = time.time()
+        msg = state_estimate_t.decode(data)
+        T = vision.transformation.Transformation(
+            q = quaternion.from_float_array(msg.quat),
+            t = np.array(msg.p0))
+        if cheetah_prev_t is None:
+            variance = 0
+        else:
+            delta_variance = (t - cheetah_prev_t) * 0.05
+            variance = cheetah_prev_variance + delta_variance
+        cheetah_prev_t = t
+        cheetah_prev_variance = variance
+        cheetah_recorder.update(t, T, variance)
+        if len(realsense_recorder) > 0 and realsense_ref is None:
+            _, T_realsense, _ = realsense_recorder.measure_abs()
+            realsense_ref = T * T_realsense.change_basis(realsense_basis).inverse()
+        fuse_poses(t, T, variance, copy.copy(msg))
+
+    node = lcm.LCM()
+    realsense_subscription = node.subscribe("REALSENSE_POSE", handle_realsense)
+    realsense_subscription.set_queue_capacity(1)
+
+    cheetah_subscription = node.subscribe("CHEETAH_state_estimate", handle_cheetah)
+    cheetah_subscription.set_queue_capacity(1)
+
+    while True:
+        node.handle()

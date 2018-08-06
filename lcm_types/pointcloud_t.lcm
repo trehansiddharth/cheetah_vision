@@ -1,0 +1,7 @@
+package lcm_types;
+
+struct pointcloud_t {
+    double timestamp;
+    int32_t n;
+    double points[n];
+}

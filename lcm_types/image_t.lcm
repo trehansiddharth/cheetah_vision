@@ -1,0 +1,10 @@
+package lcm_types;
+
+struct image_t {
+    double timestamp;
+    string format;
+    int32_t height;
+    int32_t width;
+    int32_t n;
+    byte data[n];
+}

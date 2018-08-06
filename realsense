@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+import realsense2
+import slam
+import tempfile
+import time
+import json
+import os
+import numpy as np
+import lcmutils
+from lcm_types.pose_t import pose_t
+from lcm_types.pointcloud_t import pointcloud_t
+from lcm_types.image_t import image_t
+import transformation
+import optparse
+
+class RealsenseCamera:
+    def __init__(self, parameter_file, vocabulary_file):
+        with open(parameter_file) as f:
+            self.parameters = json.load(f)
+        self.vocabulary_file = vocabulary_file
+        self.template = """%YAML:1.0
+
+        Camera.fx: {fx}
+        Camera.fy: {fy}
+        Camera.cx: {cx}
+        Camera.cy: {cy}
+
+        Camera.k1: {k1}
+        Camera.k2: {k2}
+        Camera.p1: {p1}
+        Camera.p2: {p2}
+        Camera.k3: {k3}
+
+        Camera.width: {width}
+        Camera.height: {height}
+
+        Camera.fps: {fps}
+
+        Camera.bf: {bf}
+
+        Camera.RGB: 1
+
+        ThDepth: 40.0
+
+        DepthMapFactor: 5000.0
+
+        ORBextractor.nFeatures: 1000
+        ORBextractor.scaleFactor: 1.2
+        ORBextractor.nLevels: 8
+        ORBextractor.iniThFAST: 20
+        ORBextractor.minThFAST: 7"""
+
+    def initialize(self):
+        config_contents = self.template.format(**self.parameters)
+        fd, config_file = tempfile.mkstemp()
+        os.write(fd, bytes(config_contents, "UTF-8"))
+        os.write(fd, bytes(os.linesep, "UTF-8"))
+        os.close(fd)
+        self.slam = slam.SLAM(self.vocabulary_file, config_file)
+        height = int(self.parameters["height"])
+        width = int(self.parameters["width"])
+        fps = int(self.parameters["fps"])
+        self.realsense = realsense2.RealsenseReader(height, width, fps)
+
+    def get_scene(self):
+        frameset = self.realsense.get_frames()
+        t = time.time() - self.parameters["delay"]
+        pose = np.array(self.slam.update(frameset.color, frameset.depth, t))
+        points = np.array(frameset.vertices)
+        points = points[np.where(np.any(points, axis=1))]
+        color = np.array(frameset.color).astype("uint8")
+        if pose.size == 1:
+            return t, None, points, color
+        else:
+            pose = pose[:3,:]
+            pose[:,3] *= 5.08
+            return t, transformation.from_pose_matrix(pose).inverse(), points, color
+
+if __name__ == "__main__":
+    parser = optparse.OptionParser()
+
+    parser.add_option("-u", "--url", dest="url", help="Publish packets to LCMURL", metavar="LCMURL", default=None)
+    parser.add_option("-c", "--config", dest="config", help="Read Realsense and ORBSLAM config from CONFIGFILE", metavar="CONFIGFILE")
+    parser.add_option("-v", "--vocabulary", dest="vocabulary", help="Read ORBSLAM vocabulary from VOCABFILE", metavar="VOCABFILE")
+    parser.add_option("-p", "--pose", dest="pose", help="Publish pose to POSECHANNEL", metavar="POSECHANNEL", default="REALSENSE_POSE")
+    parser.add_option("-t", "--pointcloud", dest="pointcloud", help="Publish pointcloud to POINTCLOUDCHANNEL", metavar="POINTCLOUDCHANNEL", default="REALSENSE_POINTCLOUD")
+    parser.add_option("-i", "--image", dest="image", help="Publish RGB image to IMAGECHANNEL", metavar="IMAGECHANNEL", default="REALSENSE_IMAGE")
+
+    (options, args) = parser.parse_args()
+
+    node = lcmutils.node(options.url)
+
+    camera = RealsenseCamera(options.config, options.vocabulary)
+    camera.initialize()
+    while True:
+        timestamp, pose, points, color = camera.get_scene()
+        if pose is not None:
+            msg = pose_t()
+            msg.timestamp = timestamp
+            arr = pose.as_array()
+            msg.orientation = arr[:4]
+            msg.position = arr[4:]
+            node.publish(options.pose, msg.encode())
+        if points is not None:
+            msg = pointcloud_t()
+            msg.timestamp = timestamp
+            msg.n = points.size
+            msg.points = points.reshape(-1)
+            node.publish(options.pointcloud, msg.encode())
+        if color is not None:
+            msg = image_t()
+            msg.timestamp = timestamp
+            msg.format = "rgb"
+            msg.height = color.shape[0]
+            msg.width = color.shape[1]
+            msg.n = color.size
+            msg.data = color.tobytes()
+            node.publish(options.image, msg.encode())
+
