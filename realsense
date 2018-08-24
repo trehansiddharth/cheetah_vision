@@ -10,7 +10,9 @@ import lcmutils
 from lcm_types.pose_t import pose_t
 from lcm_types.pointcloud_t import pointcloud_t
 from lcm_types.image_t import image_t
+from lcm_types.state_estimate_t import state_estimate_t
 import transformation
+import quaternion
 import optparse
 
 class RealsenseCamera:
@@ -77,7 +79,10 @@ class RealsenseCamera:
             return t, transformation.from_pose_matrix(pose).inverse(), points, color
 
 if __name__ == "__main__":
-    parser = optparse.OptionParser()
+    help_text = ("Connects to the Realsense camera with librealsense2 API, runs visual "
+    "SLAM with ORB_SLAM2 API, and publishes pose, image, and pointcloud over LCM.")
+
+    parser = optparse.OptionParser(description=help_text)
 
     parser.add_option("-u", "--url", dest="url", help="Publish packets to LCMURL", metavar="LCMURL", default=None)
     parser.add_option("-c", "--config", dest="config", help="Read Realsense and ORBSLAM config from CONFIGFILE", metavar="CONFIGFILE")
@@ -90,23 +95,44 @@ if __name__ == "__main__":
 
     node = lcmutils.node(options.url)
 
+    realsense_basis = transformation.Transformation(
+        q = quaternion.from_float_array([0.4784, 0.5158, 0.5264, 0.4790]),
+        t = np.array([0.4041, -0.0778, -0.0698]))
+    realsense_ref = None
+    cheetah_T = None
+
+    def cheetah_callback(msg):
+        global cheetah_T
+        cheetah_T = transformation.Transformation(
+            q = quaternion.from_float_array(msg.quat),
+            t = np.array(msg.p0))
+
+    cheetah_subscription = lcmutils.subscribe(node, "CHEETAH_state_estimate", state_estimate_t, cheetah_callback, verbose=False)
+
     camera = RealsenseCamera(options.config, options.vocabulary)
     camera.initialize()
+    pose = None
+    while pose is None:
+        timestamp, pose, points, color = camera.get_scene()
+    node.handle()
+    realsense_ref = cheetah_T * pose.change_basis(realsense_basis).inverse()
+    lcmutils.unsubscribe(node, cheetah_subscription)
     while True:
         timestamp, pose, points, color = camera.get_scene()
         if pose is not None:
+            realsense_T = realsense_ref * pose.change_basis(realsense_basis)
             msg = pose_t()
             msg.timestamp = timestamp
-            arr = pose.as_array()
+            arr = realsense_T.as_array().astype("float32")
             msg.orientation = arr[:4]
             msg.position = arr[4:]
             node.publish(options.pose, msg.encode())
-        if points is not None:
-            msg = pointcloud_t()
-            msg.timestamp = timestamp
-            msg.n = points.size
-            msg.points = points.reshape(-1)
-            node.publish(options.pointcloud, msg.encode())
+            if points is not None:
+                msg = pointcloud_t()
+                msg.timestamp = timestamp
+                msg.n = points.size
+                msg.points = (realsense_basis * points).astype("float32").reshape(-1)
+                node.publish(options.pointcloud, msg.encode())
         if color is not None:
             msg = image_t()
             msg.timestamp = timestamp

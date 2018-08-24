@@ -49,6 +49,10 @@ def print_stats(channel, delays, interval):
     print_stats_thread.setDaemon(True)
     print_stats_thread.start()
 
+def unsubscribe(node, subscriptions):
+    for subscription in subscriptions:
+        node.unsubscribe(subscription)
+
 def subscribe(node, channel, lcm_type, callback, verbose=True):
     delays = History(100)
     def raw_callback(channel, data):
@@ -61,6 +65,7 @@ def subscribe(node, channel, lcm_type, callback, verbose=True):
     subscription.set_queue_capacity(1)
     if verbose:
         print_stats(channel, delays, 1.0)
+    return [subscription]
 
 def subscribe_sync(node, channel_sync, lcm_type_sync,
     channels, lcm_types, callback, verbose=True):
@@ -81,13 +86,17 @@ def subscribe_sync(node, channel_sync, lcm_type_sync,
             t_end = time.time()
             if verbose:
                 delays.update(t_start, t_end - t_start)
+    subscriptions = []
     for i, channel in enumerate(channels):
         subscription = node.subscribe(channel, gen_callback(i))
         subscription.set_queue_capacity(1)
+        subscriptions.append(subscription)
     subscription = node.subscribe(channel_sync, sync_callback)
     subscription.set_queue_capacity(1)
+    subscriptions.insert(0, subscription)
     if verbose:
         print_stats(", ".join(channels) + " ~ " + channel_sync , delays, 1.0)
+    return subscriptions
 
 def publish(node, channel, message):
     node.publish(channel, message.encode())

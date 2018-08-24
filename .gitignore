@@ -1,0 +1,4 @@
+data/
+lcm_types/**/*.py
+lcm_types/**/*.pyc
+__pycache__
