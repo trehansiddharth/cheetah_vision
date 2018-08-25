@@ -221,4 +221,5 @@ if __name__ == "__main__":
 
     while running:
         node.handle()
+    cv2.imwrite("map.png", lattice.arr.astype("uint8") * 255)
 

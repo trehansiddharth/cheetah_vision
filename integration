@@ -4,9 +4,9 @@ import quaternion
 import transformation
 import collections
 import bisect
-import lcm
-from vision.state_estimate_t import state_estimate_t
-from vision.pose_t import pose_t
+import lcmutils
+from lcm_types.state_estimate_t import state_estimate_t
+from lcm_types.pose_t import pose_t
 import copy
 import time
 
@@ -86,10 +86,6 @@ if __name__ == "__main__":
     cheetah_recorder = Recorder(1000)
     fused_recorder = Recorder(1000)
 
-    realsense_basis = transformation.Transformation(
-        q = quaternion.from_float_array([0.4784, 0.5158, 0.5264, 0.4790]),
-        t = np.array([0.4041, -0.0778, -0.0698]))
-    realsense_ref = None
     def fuse_poses(t_cheetah, T_cheetah, variance_cheetah, msg):
         if len(realsense_recorder) == 0:
             fused_vars = t_cheetah, T_cheetah, variance_cheetah
@@ -109,9 +105,8 @@ if __name__ == "__main__":
         msg.p0 = arr[4:]
         node.publish("CHEETAH_state_estimate_fused", msg.encode())
 
-    def handle_realsense(channel, data):
+    def handle_realsense(msg):
         t = time.time() - 0.2
-        msg = pose_t.decode(data)
         T = transformation.Transformation(
             q = quaternion.from_float_array(msg.orientation),
             t = np.array(msg.position))
@@ -122,12 +117,11 @@ if __name__ == "__main__":
     
     cheetah_prev_t = None
     cheetah_prev_variance = 0
-    def handle_cheetah(channel, data):
+    def handle_cheetah(msg):
         global cheetah_prev_t
         global cheetah_prev_variance
         global realsense_ref
         t = time.time()
-        msg = state_estimate_t.decode(data)
         T = transformation.Transformation(
             q = quaternion.from_float_array(msg.quat),
             t = np.array(msg.p0))
@@ -139,17 +133,11 @@ if __name__ == "__main__":
         cheetah_prev_t = t
         cheetah_prev_variance = variance
         cheetah_recorder.update(t, T, variance)
-        if len(realsense_recorder) > 0 and realsense_ref is None:
-            _, T_realsense, _ = realsense_recorder.measure_abs()
-            realsense_ref = T * T_realsense.change_basis(realsense_basis).inverse()
         fuse_poses(t, T, variance, copy.copy(msg))
 
-    node = lcm.LCM()
-    realsense_subscription = node.subscribe("REALSENSE_POSE", handle_realsense)
-    realsense_subscription.set_queue_capacity(1)
-
-    cheetah_subscription = node.subscribe("CHEETAH_state_estimate", handle_cheetah)
-    cheetah_subscription.set_queue_capacity(1)
+    node = lcmutils.node(None)
+    lcmutils.subscribe(node, "REALSENSE_POSE", pose_t, handle_realsense)
+    lcmutils.subscribe(node, "CHEETAH_state_estimate", state_estimate_t, handle_cheetah)
 
     while True:
         node.handle()
