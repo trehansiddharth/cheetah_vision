@@ -4,5 +4,4 @@ struct pointcloud_t {
     double timestamp;
     int32_t n;
     double points[n];
-    string frame;
 }

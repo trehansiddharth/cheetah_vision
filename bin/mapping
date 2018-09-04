@@ -10,10 +10,11 @@ from lcm_types.pose_t import pose_t
 from lcm_types.pointcloud_t import pointcloud_t
 from lcm_types.image_t import image_t
 import threading
+import json
 import optparse
 
 def as_slice(indices):
-    return tuple(indices.transpose())
+    return indices.transpose()
 
 class Subspace:
     def __init__(self, T, Tinv, R, Rinv, origin):
@@ -35,37 +36,49 @@ class Subspace:
     def _parameters(self):
         return (self.T, self.Tinv, self.R, self.Rinv, self.origin)
 
-    def project(self, points):
-        images = (points - self.origin) @ self.Tinv
-        projections = (points - self.origin) @ self.Rinv
+    def project(self, points, method="orthographic"):
+        if method == "orthographic":
+            images = (points - self.origin) @ self.Tinv
+            projections = (points - self.origin) @ self.Rinv
+        elif method == "perspective":
+            projections = (points - self.origin) @ self.Rinv
+            images = ((points - self.origin) @ self.Tinv) / projections
         return images, projections
+    
+    def project_vector(self, vector):
+        return vector @ self.Tinv
 
-    def deproject(self, images, projections=None):
-        inplane = images @ self.T + self.origin
-        outplane = 0 if projections is None else projections @ self.R
+    def deproject(self, images, projections=None, method="orthographic"):
+        if method == "orthographic":
+            inplane = images @ self.T + self.origin
+            outplane = 0 if projections is None else projections @ self.R
+        elif method == "perspective":
+            outplane = 0 if projections is None else projections @ self.R
+            depths = 1 if projections is None else np.linalg.norm(outplane, axis=1).reshape(-1, 1)
+            inplane = depths * (images @ self.T) + self.origin
         return inplane + outplane
 
-    def accomodate(self, points):
-        points_T, _ = self.project(points)
-        origin = points_T.min(axis=0)
+    def accomodate(self, points, method="orthographic"):
+        points_T, _ = self.project(points, method=method)
+        offset = points_T.min(axis=0)
         terminus = points_T.max(axis=0)
-        shape = (terminus - origin).astype("int") + 2
+        shape = (terminus - offset).astype("int") + 3
 
         subspace = Subspace(*self._parameters())
-        subspace.origin = self.deproject(origin)
 
-        return Lattice(np.empty(shape), subspace)
+        return Lattice(np.empty(shape), subspace, offset.astype("int"))
 
 class Lattice(Subspace):
-    def __init__(self, arr, subspace):
+    def __init__(self, arr, subspace, offset=0):
         Subspace.__init__(self, *subspace._parameters())
         self.arr = arr
+        self.offset = offset
 
     def __getitem__(self, slc):
-        return self.arr[slc]
+        return self.arr[tuple(slc - self.offset)]
 
     def __setitem__(self, slc, values):
-        self.arr[slc] = values
+        self.arr[tuple(slc - self.offset)] = values
     
     def filter(self, indices):
         return indices[self.argfilter(indices)]
@@ -77,10 +90,27 @@ class Lattice(Subspace):
         return np.around(indices).astype("int")
 
     def indices(self):
-        return np.array(list(np.ndindex(self.arr.shape)))
+        return np.array(list(np.ndindex(self.arr.shape))) + self.offset
 
     def points(self):
         return self.deproject(self.indices())
+
+def minimum_lattice_distance(basis, px):
+    n, k = basis.shape
+    diagonals = px * cartesian_product((np.array([1, -1]),) * n)
+    return np.max(diagonals @ basis)
+
+def depth_transform(points, subspace, method="orthographic"):
+    lattice = subspace.accomodate(points, method=method)
+    indices, depths = lattice.project(points, method=method)
+    lattice.arr[:] = np.inf
+
+    depths_argsort = np.argsort(-depths, axis=0).reshape(-1)
+    depths_sorted = depths[depths_argsort]
+    indices_sorted = lattice.round(indices[depths_argsort])
+
+    lattice[as_slice(indices_sorted)] = depths_sorted.reshape(-1)
+    return lattice
 
 def update_heightmap(lattice, points):
     indices, heights = lattice.project(points)
@@ -98,6 +128,23 @@ def update_occupancy_grid(lattice, points):
     indices = indices[(heights.reshape(-1) > 0.1) & (heights.reshape(-1) < 4)]
     indices = lattice.filter(lattice.round(indices))
     lattice[as_slice(indices)] = 1
+
+def update_occupancy_grid_shadowed(lattice, points, camera, principal, fpx):
+    indices, heights = lattice.project(points)
+    indices = indices[(heights.reshape(-1) > 0.1) & (heights.reshape(-1) < 4)]
+    if len(indices) > 0:
+        tangential = np.cross(lattice.R[0], principal)
+        principal_proj = lattice.project_vector(principal).reshape(1, -1)
+        principal_proj = principal_proj / np.linalg.norm(principal_proj)
+        tangential_proj = lattice.project_vector(tangential).reshape(1, -1)
+        tangential_proj = tangential_proj / (np.linalg.norm(tangential_proj) * fpx)
+        camera_proj, _ = lattice.project(camera)
+        subspace = Subspace.from_components(tangential_proj, principal_proj)
+        line = depth_transform(indices, subspace, method="perspective")
+        mask = line.arr != np.inf
+        shadow = line.deproject(line.indices()[mask], line.arr.reshape(-1, 1)[mask], method="perspective")
+        shadow = lattice.filter(lattice.round(shadow))
+        lattice[as_slice(shadow)] = 1
 
 def normed_convolution(array, kernel):
     zeros = array.copy()
@@ -145,6 +192,7 @@ if __name__ == "__main__":
     parser = optparse.OptionParser()
 
     parser.add_option("-u", "--url", dest="url", help="Publish packets to LCMURL", metavar="LCMURL", default=None)
+    parser.add_option("-c", "--config", dest="config", help="Read camera config from CONFIGFILE", metavar="CONFIGFILE")
     parser.add_option("-p", "--pose", dest="pose", help="Read pose from POSECHANNEL", metavar="POSECHANNEL", default="REALSENSE_POSE")
     parser.add_option("-t", "--pointcloud", dest="pointcloud", help="Read pointcloud from POINTCLOUDCHANNEL", metavar="POINTCLOUDCHANNEL", default="REALSENSE_POINTCLOUD")
     parser.add_option("-m", "--map", dest="map", help="Publish map to MAPCHANNEL", metavar="MAPCHANNEL", default="INTEGRATED_MAP")
@@ -153,6 +201,9 @@ if __name__ == "__main__":
     (options, args) = parser.parse_args()
 
     node = lcmutils.node(options.url)
+
+    with open(options.config) as f:
+        config = json.load(f)
 
     delta = 0.02
     basis = delta * np.array([[1, 0, 0], [0, 1, 0]])
@@ -182,7 +233,9 @@ if __name__ == "__main__":
         pose = transformation.from_array(pose_array)
         points = np.array(msg_pointcloud.points).reshape(int(msg_pointcloud.n / 3), 3)
         points = pose * points
-        update_occupancy_grid(lattice, points)
+        camera = pose.t
+        principal = pose * np.array([[1, 0, 0]]) - camera
+        update_occupancy_grid_shadowed(lattice, points, camera, principal, config["fx"])
     
     running = True
     def planner():
