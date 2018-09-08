@@ -13,9 +13,6 @@ import threading
 import json
 import optparse
 
-def as_slice(indices):
-    return indices.transpose()
-
 class Subspace:
     def __init__(self, T, Tinv, R, Rinv, origin):
         self.T = T
@@ -75,10 +72,10 @@ class Lattice(Subspace):
         self.offset = offset
 
     def __getitem__(self, slc):
-        return self.arr[tuple(slc - self.offset)]
+        return self.arr[tuple(slc.transpose() - self.offset)]
 
     def __setitem__(self, slc, values):
-        self.arr[tuple(slc - self.offset)] = values
+        self.arr[tuple(slc.transpose() - self.offset)] = values
     
     def filter(self, indices):
         return indices[self.argfilter(indices)]
@@ -109,7 +106,7 @@ def depth_transform(points, subspace, method="orthographic"):
     depths_sorted = depths[depths_argsort]
     indices_sorted = lattice.round(indices[depths_argsort])
 
-    lattice[as_slice(indices_sorted)] = depths_sorted.reshape(-1)
+    lattice[indices_sorted] = depths_sorted.reshape(-1)
     return lattice
 
 def update_heightmap(lattice, points):
@@ -121,13 +118,13 @@ def update_heightmap(lattice, points):
     boundsmask = lattice.argfilter(indices)
     heights = heights[boundsmask]
     indices = lattice.round(indices[boundsmask])
-    lattice[as_slice(indices)] = heights.reshape(-1)
+    lattice[indices] = heights.reshape(-1)
 
 def update_occupancy_grid(lattice, points):
     indices, heights = lattice.project(points)
     indices = indices[(heights.reshape(-1) > 0.1) & (heights.reshape(-1) < 4)]
     indices = lattice.filter(lattice.round(indices))
-    lattice[as_slice(indices)] = 1
+    lattice[indices] = 1
 
 def update_occupancy_grid_shadowed(lattice, points, camera, principal, fpx):
     indices, heights = lattice.project(points)
@@ -144,7 +141,7 @@ def update_occupancy_grid_shadowed(lattice, points, camera, principal, fpx):
         mask = line.arr != np.inf
         shadow = line.deproject(line.indices()[mask], line.arr.reshape(-1, 1)[mask], method="perspective")
         shadow = lattice.filter(lattice.round(shadow))
-        lattice[as_slice(shadow)] = 1
+        lattice[shadow] = 1
 
 def normed_convolution(array, kernel):
     zeros = array.copy()
@@ -235,7 +232,11 @@ if __name__ == "__main__":
         points = pose * points
         camera = pose.t
         principal = pose * np.array([[1, 0, 0]]) - camera
-        update_occupancy_grid_shadowed(lattice, points, camera, principal, config["fx"])
+        update_occupancy_grid(lattice, points) #, camera, principal, config["fx"])
+        # if options.visualize:
+        #     img = 255 * lattice.arr
+        #     cv2.imshow("grid", img)
+        #     cv2.waitKey(1)
     
     running = True
     def planner():
@@ -265,8 +266,11 @@ if __name__ == "__main__":
                     if cv2.waitKey(1) == ord("q"):
                         running = False
     
-    lcmutils.subscribe_sync(node, options.pointcloud, pointcloud_t,
-        [options.pose], [pose_t], input_handler, verbose=True)
+    # lcmutils.subscribe_sync(node, options.pointcloud, pointcloud_t,
+    #     [options.pose], [pose_t], input_handler, verbose=True)
+    
+    lcmutils.subscribe_sync_exact(node, [options.pointcloud, options.pose],
+        [pointcloud_t, pose_t], input_handler, verbose=True)
     
     planner_thread = threading.Thread(target=planner)
     planner_thread.setDaemon(True)

@@ -6,16 +6,36 @@ import collections
 import bisect
 
 class History:
-    def __init__(self, capacity):
-        self.ts = collections.deque(maxlen=capacity)
-        self.values = collections.deque(maxlen=capacity)
+    def __init__(self, ts, values):
+        self.capacity = ts.maxlen
+        self.ts = ts
+        self.values = values
+    
+    @staticmethod
+    def with_capacity(capacity):
+        return History(collections.deque(maxlen=capacity),
+            collections.deque(maxlen=capacity))
     
     def update(self, t, value):
-        self.ts.append(t)
-        self.values.append(value)
+        if len(self) >= self.capacity:
+            del self[0]
+        i_at = bisect.bisect(self.ts, t)
+        self.ts.insert(i_at, t)
+        self.values.insert(i_at, value)
+        return i_at
 
     def __len__(self):
         return len(self.values)
+    
+    def __getitem__(self, slc):
+        return History(self.ts[slc], self.values[slc])
+    
+    def __setitem__(self, slc, values):
+        self.values[slc] = values
+    
+    def __delitem__(self, slc):
+        del self.ts[slc]
+        del self.values[slc]
     
     def lastest(self):
         return self.ts[-1], self.values[-1]
@@ -28,6 +48,13 @@ class History:
             i_at = min(i_at, len(self.ts) - 1)
 
             return self.ts[i_at], self.values[i_at]
+    
+    def index_of(self, t):
+        i = bisect.bisect(self.ts, t)
+        if i > 0 and self.ts[i-1] == t:
+            return i - 1
+        else:
+            return None
 
 def node(url):
     if url is None:
@@ -54,7 +81,7 @@ def unsubscribe(node, subscriptions):
         node.unsubscribe(subscription)
 
 def subscribe(node, channel, lcm_type, callback, verbose=True):
-    delays = History(100)
+    delays = History.with_capacity(100)
     def raw_callback(channel, data):
         t_start = time.time()
         callback(lcm_type.decode(data))
@@ -68,9 +95,9 @@ def subscribe(node, channel, lcm_type, callback, verbose=True):
     return [subscription]
 
 def subscribe_sync(node, channel_sync, lcm_type_sync,
-    channels, lcm_types, callback, verbose=True):
-    histories = [History(100) for channel in channels]
-    delays = History(100)
+    channels, lcm_types, callback, verbose=True, memory=100):
+    histories = [History.with_capacity(memory) for channel in channels]
+    delays = History.with_capacity(memory)
     def gen_callback(i):
         def raw_callback(channel, data):
             msg = lcm_types[i].decode(data)
@@ -95,7 +122,40 @@ def subscribe_sync(node, channel_sync, lcm_type_sync,
     subscription.set_queue_capacity(1)
     subscriptions.insert(0, subscription)
     if verbose:
-        print_stats(", ".join(channels) + " ~ " + channel_sync , delays, 1.0)
+        print_stats(", ".join(channels) + " ~ " + channel_sync, delays, 1.0)
+    return subscriptions
+
+def subscribe_sync_exact(node, channels, lcm_types, callback, verbose=True, memory=10):
+    history = History.with_capacity(memory)
+    delays = History.with_capacity(memory)
+    n = len(channels)
+    def gen_callback(i):
+        def raw_callback(channel, data):
+            msg = lcm_types[i].decode(data)
+            i_at = history.index_of(msg.timestamp)
+            if i_at is None:
+                value = [None] * n
+                value[i] = msg
+                i_at = history.update(msg.timestamp, value)
+            elif i_at is not None:
+                history.values[i_at][i] = msg
+            if i_at is not None:
+                if not None in history.values[i_at]:
+                    callback(*history.values[i_at])
+                i_before = 0
+                for _ in range(i_at):
+                    if history.values[i_before][i] is None:
+                        del history[i_before]
+                    else:
+                        i_before += 1
+        return raw_callback
+    subscriptions = []
+    for i, channel in enumerate(channels):
+        subscription = node.subscribe(channel, gen_callback(i))
+        subscription.set_queue_capacity(1)
+        subscriptions.append(subscription)
+    if verbose:
+        print_stats(", ".join(channels), delays, 1.0)
     return subscriptions
 
 def publish(node, channel, message):

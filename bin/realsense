@@ -22,6 +22,7 @@ if __name__ == "__main__":
     parser.add_option("-p", "--pose", dest="pose", help="Publish pose to POSECHANNEL", metavar="POSECHANNEL", default="REALSENSE_POSE")
     parser.add_option("-t", "--pointcloud", dest="pointcloud", help="Publish pointcloud to POINTCLOUDCHANNEL", metavar="POINTCLOUDCHANNEL", default="REALSENSE_POINTCLOUD")
     parser.add_option("-i", "--image", dest="image", help="Publish RGB image to IMAGECHANNEL", metavar="IMAGECHANNEL", default="REALSENSE_IMAGE")
+    parser.add_option("-d", "--debug", dest="debug", help="Enable debug mode (don't wait for cheetah communications)", action="store_true")
 
     (options, args) = parser.parse_args()
 
@@ -33,26 +34,31 @@ if __name__ == "__main__":
     realsense_ref = None
     cheetah_T = None
 
-    def cheetah_callback(msg):
-        global cheetah_T
-        cheetah_T = transformation.Transformation(
-            q = quaternion.from_float_array(msg.quat),
-            t = np.array(msg.p0))
+    if not options.debug:
+        def cheetah_callback(msg):
+            global cheetah_T
+            cheetah_T = transformation.Transformation(
+                q = quaternion.from_float_array(msg.quat),
+                t = np.array(msg.p0))
 
-    cheetah_subscription = lcmutils.subscribe(node, "CHEETAH_state_estimate", state_estimate_t, cheetah_callback, verbose=False)
+        cheetah_subscription = lcmutils.subscribe(node, "CHEETAH_state_estimate", state_estimate_t, cheetah_callback, verbose=False)
 
     camera = realsense.RealsenseCamera(options.config, options.vocabulary)
     camera.initialize()
     pose = None
     while pose is None:
         timestamp, pose, points, color = camera.get_scene()
-    node.handle()
-    realsense_ref = cheetah_T * pose.change_basis(realsense_basis).inverse()
-    lcmutils.unsubscribe(node, cheetah_subscription)
+    if not options.debug:
+        node.handle()
+        realsense_ref = cheetah_T * pose.change_basis(realsense_basis).inverse()
+        lcmutils.unsubscribe(node, cheetah_subscription)
     while True:
         timestamp, pose, points, color = camera.get_scene()
         if pose is not None:
-            realsense_T = realsense_ref * pose.change_basis(realsense_basis)
+            if options.debug:
+                realsense_T = pose.change_basis(realsense_basis)
+            else:
+                realsense_T = realsense_ref * pose.change_basis(realsense_basis)
             msg = pose_t()
             msg.timestamp = timestamp
             arr = realsense_T.as_array().astype("float32")
