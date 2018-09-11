@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import numpy as np
 import transformation
-import scipy.ndimage
+import mapping
 import cv2
 import skfmm
 import numpy.ma as npmask
@@ -12,153 +12,6 @@ from lcm_types.image_t import image_t
 import threading
 import json
 import optparse
-
-class Subspace:
-    def __init__(self, T, Tinv, R, Rinv, origin):
-        self.T = T
-        self.Tinv = Tinv
-        self.R = R
-        self.Rinv = Rinv
-        self.origin = origin
-
-    @staticmethod
-    def from_components(basis, normal, origin=0):
-        T = basis
-        Tinv = np.linalg.pinv(basis)
-        R = normal
-        Rinv = np.linalg.pinv(normal)
-        origin = origin
-        return Subspace(T, Tinv, R, Rinv, origin)
-
-    def _parameters(self):
-        return (self.T, self.Tinv, self.R, self.Rinv, self.origin)
-
-    def project(self, points, method="orthographic"):
-        if method == "orthographic":
-            images = (points - self.origin) @ self.Tinv
-            projections = (points - self.origin) @ self.Rinv
-        elif method == "perspective":
-            projections = (points - self.origin) @ self.Rinv
-            images = ((points - self.origin) @ self.Tinv) / projections
-        return images, projections
-    
-    def project_vector(self, vector):
-        return vector @ self.Tinv
-
-    def deproject(self, images, projections=None, method="orthographic"):
-        if method == "orthographic":
-            inplane = images @ self.T + self.origin
-            outplane = 0 if projections is None else projections @ self.R
-        elif method == "perspective":
-            outplane = 0 if projections is None else projections @ self.R
-            depths = 1 if projections is None else np.linalg.norm(outplane, axis=1).reshape(-1, 1)
-            inplane = depths * (images @ self.T) + self.origin
-        return inplane + outplane
-
-    def accomodate(self, points, method="orthographic"):
-        points_T, _ = self.project(points, method=method)
-        offset = points_T.min(axis=0)
-        terminus = points_T.max(axis=0)
-        shape = (terminus - offset).astype("int") + 3
-
-        subspace = Subspace(*self._parameters())
-
-        return Lattice(np.empty(shape), subspace, offset.astype("int"))
-
-class Lattice(Subspace):
-    def __init__(self, arr, subspace, offset=0):
-        Subspace.__init__(self, *subspace._parameters())
-        self.arr = arr
-        self.offset = offset
-
-    def __getitem__(self, slc):
-        return self.arr[tuple(slc.transpose() - self.offset)]
-
-    def __setitem__(self, slc, values):
-        self.arr[tuple(slc.transpose() - self.offset)] = values
-    
-    def filter(self, indices):
-        return indices[self.argfilter(indices)]
-    
-    def argfilter(self, indices):
-        return np.all(indices > 0, axis=1) & np.all(indices < self.arr.shape, axis=1)
-
-    def round(self, indices):
-        return np.around(indices).astype("int")
-
-    def indices(self):
-        return np.array(list(np.ndindex(self.arr.shape))) + self.offset
-
-    def points(self):
-        return self.deproject(self.indices())
-
-def minimum_lattice_distance(basis, px):
-    n, k = basis.shape
-    diagonals = px * cartesian_product((np.array([1, -1]),) * n)
-    return np.max(diagonals @ basis)
-
-def depth_transform(points, subspace, method="orthographic"):
-    lattice = subspace.accomodate(points, method=method)
-    indices, depths = lattice.project(points, method=method)
-    lattice.arr[:] = np.inf
-
-    depths_argsort = np.argsort(-depths, axis=0).reshape(-1)
-    depths_sorted = depths[depths_argsort]
-    indices_sorted = lattice.round(indices[depths_argsort])
-
-    lattice[indices_sorted] = depths_sorted.reshape(-1)
-    return lattice
-
-def update_heightmap(lattice, points):
-    indices, heights = lattice.project(points)
-    indices = np.round(indices)
-    heightmask = (heights.reshape(-1) > 0.1) & (heights.reshape(-1) < 4)
-    heights = heights[heightmask]
-    indices = indices[heightmask]
-    boundsmask = lattice.argfilter(indices)
-    heights = heights[boundsmask]
-    indices = lattice.round(indices[boundsmask])
-    lattice[indices] = heights.reshape(-1)
-
-def update_occupancy_grid(lattice, points):
-    indices, heights = lattice.project(points)
-    indices = indices[(heights.reshape(-1) > 0.1) & (heights.reshape(-1) < 4)]
-    indices = lattice.filter(lattice.round(indices))
-    lattice[indices] = 1
-
-def update_occupancy_grid_shadowed(lattice, points, camera, principal, fpx):
-    indices, heights = lattice.project(points)
-    indices = indices[(heights.reshape(-1) > 0.1) & (heights.reshape(-1) < 4)]
-    if len(indices) > 0:
-        tangential = np.cross(lattice.R[0], principal)
-        principal_proj = lattice.project_vector(principal).reshape(1, -1)
-        principal_proj = principal_proj / np.linalg.norm(principal_proj)
-        tangential_proj = lattice.project_vector(tangential).reshape(1, -1)
-        tangential_proj = tangential_proj / (np.linalg.norm(tangential_proj) * fpx)
-        camera_proj, _ = lattice.project(camera)
-        subspace = Subspace.from_components(tangential_proj, principal_proj)
-        line = depth_transform(indices, subspace, method="perspective")
-        mask = line.arr != np.inf
-        shadow = line.deproject(line.indices()[mask], line.arr.reshape(-1, 1)[mask], method="perspective")
-        shadow = lattice.filter(lattice.round(shadow))
-        lattice[shadow] = 1
-
-def normed_convolution(array, kernel):
-    zeros = array.copy()
-    zeros[array == np.inf] = 0
-    ones = np.ones_like(array)
-    ones[array == np.inf] = 0
-    unnormed = scipy.ndimage.filters.convolve(zeros, kernel)
-    population = scipy.ndimage.filters.convolve(ones, kernel)
-    return unnormed / population
-
-def interpolate_lattice(lattice, gamma=1.0, cutoff=5):
-    dims = len(lattice.arr.shape)
-    Xs = np.meshgrid(*([np.arange(-cutoff, cutoff + 1)] * dims))
-    kernel = np.exp(-gamma * np.linalg.norm(Xs, axis=0))
-    smoothed = normed_convolution(lattice.arr, kernel)
-    interpolated = np.where(lattice.arr == np.inf, smoothed, lattice.arr)
-    return Lattice(interpolated, Subspace(*lattice._parameters()))
 
 def barrier_force(distance):
     return -10 * distance
@@ -186,6 +39,7 @@ def potential_dynamics(inertia, damping, dt, velocity, force):
     return velocity + (dt / inertia) * (force - damping * velocity)
 
 if __name__ == "__main__":
+    # Parse command-line arguments
     parser = optparse.OptionParser()
 
     parser.add_option("-u", "--url", dest="url", help="Publish packets to LCMURL", metavar="LCMURL", default=None)
@@ -197,23 +51,30 @@ if __name__ == "__main__":
 
     (options, args) = parser.parse_args()
 
+    # Initialize the LCM node
     node = lcmutils.node(options.url)
 
+    # Load the config file to read camera parameters, etc.
     with open(options.config) as f:
         config = json.load(f)
 
+    # Construct an empty lattice to hold the occupancy grid of the environment
     delta = 0.02
     basis = delta * np.array([[1, 0, 0], [0, 1, 0]])
     normal = np.array([[0, 0, 1]])
     origin = np.array([-5, -5, 0])
-    subspace = Subspace.from_components(basis, normal, origin)
+    subspace = mapping.Subspace.from_components(basis, normal, origin)
     arr = np.zeros((int(10 / delta), int(10 / delta)), dtype="uint8")
-    lattice = Lattice(arr, subspace)
+    lattice = mapping.Lattice(arr, subspace)
+
+    # Create a goal map to store where the goal point is
     goal_map = np.ones_like(arr, dtype="float")
+
+    # Store the current pose for visualization purposes
     pose = None
 
-    dilation = 5
-
+    # If visualization is turned on, enable clicking on the image to change where the goal
+    # point is
     if options.visualize:
         def grid_click(event, x, y, flags, param):
             if event == cv2.EVENT_LBUTTONUP:
@@ -224,6 +85,8 @@ if __name__ == "__main__":
         cv2.namedWindow("grid")
         cv2.setMouseCallback("grid", grid_click)
 
+    # Handle incoming pointclouds and pose over LCM by updating the occupancy grid with
+    # the new points
     def input_handler(msg_pointcloud, msg_pose):
         global pose
         pose_array = np.array(msg_pose.orientation + msg_pose.position)
@@ -232,17 +95,15 @@ if __name__ == "__main__":
         points = pose * points
         camera = pose.t
         principal = pose * np.array([[1, 0, 0]]) - camera
-        update_occupancy_grid(lattice, points) #, camera, principal, config["fx"])
-        # if options.visualize:
-        #     img = 255 * lattice.arr
-        #     cv2.imshow("grid", img)
-        #     cv2.waitKey(1)
+        mapping.update_occupancy_grid(lattice, points) #, camera, principal, config["fx"])
     
+    # Recompute potential function and show visualization of the environment
     running = True
     def planner():
         global running
         while running:
             if pose is not None:
+                # Compute the potential function for a given goal
                 try:
                     mask = lattice.arr.astype("bool")
                     scene = npmask.array(goal_map, mask=mask)
@@ -251,7 +112,9 @@ if __name__ == "__main__":
                     potential_map = goal_potential + barrier_potential
                 except ValueError:
                     potential_map = None
-
+                
+                # If visualization is turned on, show the occupancy grid, potential
+                # function, and current position and orientation of the robot
                 if options.visualize:
                     if potential_map is None:
                         img = 255 * lattice.arr
@@ -266,17 +129,17 @@ if __name__ == "__main__":
                     if cv2.waitKey(1) == ord("q"):
                         running = False
     
-    # lcmutils.subscribe_sync(node, options.pointcloud, pointcloud_t,
-    #     [options.pose], [pose_t], input_handler, verbose=True)
-    
+    # Subscribe to the pointcloud and pose channels in a synchronized way (handled by
+    # "input_handler")
     lcmutils.subscribe_sync_exact(node, [options.pointcloud, options.pose],
         [pointcloud_t, pose_t], input_handler, verbose=True)
     
+    # Run the planner thread (handled by "planner")
     planner_thread = threading.Thread(target=planner)
     planner_thread.setDaemon(True)
     planner_thread.start()
 
+    # Run the LCM node to constantly handle new incoming messages
     while running:
         node.handle()
-    cv2.imwrite("map.png", lattice.arr.astype("uint8") * 255)
 
