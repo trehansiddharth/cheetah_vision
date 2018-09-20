@@ -35,11 +35,11 @@ class RealsenseCamera:
 
         Camera.RGB: 1
 
-        ThDepth: 40.0
+        ThDepth: {thdepth}
 
         DepthMapFactor: 5000.0
 
-        ORBextractor.nFeatures: 1000
+        ORBextractor.nFeatures: {nfeatures}
         ORBextractor.scaleFactor: 1.2
         ORBextractor.nLevels: 8
         ORBextractor.iniThFAST: 20

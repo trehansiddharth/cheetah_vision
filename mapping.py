@@ -119,7 +119,7 @@ class Subspace:
             lattice: Lattice: The lattice with an empty array large enough to accommodate
                 all the provided points.
         """
-        points_T, _ = self.project(points, method=method)
+        points_T, residuals = self.project(points, method=method)
         offset = points_T.min(axis=0)
         terminus = points_T.max(axis=0)
         shape = (terminus - offset).astype("int") + 3
@@ -135,7 +135,7 @@ class Lattice(Subspace):
     for example, to store an occupancy grid of a physical environment without having to
     worry about which position in the array corresponds to which point in the real world.
     """
-    def __init__(self, arr, subspace, offset=0):
+    def __init__(self, arr, subspace, offset=0, default=np.nan):
         """
         Constructs a lattice from an array, a subspace, and an offset parameter describing
         how the origin of the array maps to the subspace.
@@ -150,7 +150,61 @@ class Lattice(Subspace):
         """
         Subspace.__init__(self, *subspace._parameters())
         self.arr = arr
+        # self.offset = tuple(self.arr.ndim * [0]) if offset == 0 else offset
         self.offset = offset
+        self.default = default
+    
+    # def resize(self, slc):        
+    #     slices = self.arr.ndim * [slice(None, None, None)
+    #     if (type(slc) == int) or (type(slc) == slice) or \
+    #         (type(slc) = np.ndarray and slc.dtype == "bool"):
+    #         slc = (slc,)
+        
+    #     new_shape = list(self.arr.shape)
+    #     new_offset = list(self.offset)
+    #     copy_slice = self.arr.ndim * [None]
+    #     for i, s in enumerate(slc):
+    #         if type(s) == int:
+    #             smallest = s + self.offset
+    #             largest = s + self.offset
+    #             slices[i] = s + self.offset
+    #         elif hasattr(s, "__iter__"):
+    #             is_mask = False
+    #             if type(s) == np.ndarray:
+    #                 if s.dtype == "bool":
+    #                     is_mask = True
+    #                     slices[i] = s
+    #                 else:
+    #                     slices[i] = s + self.offset
+    #             else:
+    #                 slices[i] = [t + self.offset for t in s]
+    #             smallest = 0 if is_mask else min(s) + self.offset
+    #             largest = 0 if is_mask else max(s) + self.offset
+    #         elif type(s) == slice:
+    #             start = s.start and s.start + self.offset
+    #             stop = s.stop and s.stop + self.offset
+    #             step = s.step
+    #             smallest = min(start, stop)
+    #             largest = max(start, stop)
+    #             slices[i] = slice(start, stop, step)
+    #         else:
+    #             raise ValueError
+            
+    #         if smallest < 0:
+    #             new_shape[i] += self.shape[i]
+    #             new_offset[i] += self.shape[i]
+    #             copy_slice[i] = slice(0, self.shape[i])
+    #         elif largest >= self.shape[i]:
+    #             newshape[i] += self.shape[i]
+    #             copy_slice[i] = slice(self.shape[i], None)
+        
+    #     if new_shape != self.shape:
+    #         new_arr = self.default * np.ones(tuple(new_shape))
+    #         new_arr[tuple(copy_slice)] = self.arr
+    #         self.arr = new_arr
+    #         self.offset = tuple(new_offset)
+        
+    #     return tuple(slices)
 
     def __getitem__(self, slc):
         """
@@ -166,6 +220,7 @@ class Lattice(Subspace):
                 corresponding to slc.
         """
         return self.arr[tuple(slc.transpose() - self.offset)]
+        #return self.arr[self.resize(slc)]
 
     def __setitem__(self, slc, values):
         """
@@ -179,6 +234,7 @@ class Lattice(Subspace):
             values: (p,) np.array: Array of values to set the corresponding indices to.
         """
         self.arr[tuple(slc.transpose() - self.offset)] = values
+        #self.arr[self.resize(slc)] = values
     
     def filter(self, indices):
         """
@@ -206,7 +262,8 @@ class Lattice(Subspace):
             mask: (p,) np.array: Boolean array indicating whether each index is within
                 the bounds of the lattice of not.
         """
-        return np.all(indices > 0, axis=1) & np.all(indices < self.arr.shape, axis=1)
+        return np.all(indices - self.offset > 0, axis=1) & \
+            np.all(indices - self.offset < self.arr.shape, axis=1)
 
     def round(self, indices):
         """
@@ -327,7 +384,29 @@ def update_heightmap(lattice, points):
     indices = lattice.round(indices[boundsmask])
     lattice[indices] = heights.reshape(-1)
 
-def update_occupancy_grid(lattice, points):
+def filter_indices(subspace, points, camera, principal, hthresh=0, dthresh=3, cthresh=4):
+    indices, heights = subspace.project(points)
+    depths = (points - camera) @ principal.reshape(3, 1)
+    mask = (heights.reshape(-1) > hthresh) & (heights.reshape(-1) < cthresh) & \
+        (depths.reshape(-1) < dthresh)
+    return indices[mask], heights[mask]
+
+def update_occupancy_grid(lattice, indices):
+    """
+    Updates an existing occupancy grid mapping a subspace with a new set of points within
+    a superspace.
+
+    Args:
+        lattice: Lattice: A lattice on an n-dimensional subspace where each value in the
+            array represents whether or not there is a point that would be projected onto
+            that position.
+        points: (p, k) np.array: Points in the k-dimensional superspace to update the
+            occupancy grid with.
+    """
+    indices = lattice.filter(lattice.round(indices))
+    lattice[indices] = 1
+
+def update_occupancy_grid_weighted(lattice, points, camera, principal, hthresh=0):
     """
     Updates an existing occupancy grid mapping a subspace with a new set of points within
     a superspace.
@@ -340,11 +419,13 @@ def update_occupancy_grid(lattice, points):
             occupancy grid with.
     """
     indices, heights = lattice.project(points)
-    indices = indices[(heights.reshape(-1) > 0.1) & (heights.reshape(-1) < 4)]
+    depths = (points - camera) @ principal.reshape(3, 1)
+    indices = indices[(heights.reshape(-1) > hthresh) & (heights.reshape(-1) < 4) & \
+        (depths.reshape(-1) < 3.0)]
     indices = lattice.filter(lattice.round(indices))
-    lattice[indices] = 1
+    lattice[indices] += 1
 
-def update_occupancy_grid_shadowed(lattice, points, camera, principal, fpx):
+def update_occupancy_grid_shadowed(lattice, points, camera, principal, fpx, hthresh=0):
     """
     Updates an existing occupancy grid mapping a subspace with a new set of points within
     a superspace, but first runs the depth transform on the points to pick only the ones
@@ -359,7 +440,9 @@ def update_occupancy_grid_shadowed(lattice, points, camera, principal, fpx):
             occupancy grid with. A depth transform is run on this to filter out noise.
     """
     indices, heights = lattice.project(points)
-    indices = indices[(heights.reshape(-1) > 0.1) & (heights.reshape(-1) < 4)]
+    depths = (points - camera) @ principal.reshape(3, 1)
+    indices = indices[(heights.reshape(-1) > hthresh) & (heights.reshape(-1) < 4.0) & \
+        (depths.reshape(-1) < 3.0)]
     if len(indices) > 0:
         tangential = np.cross(lattice.R[0], principal)
         principal_proj = lattice.project_vector(principal).reshape(1, -1)
@@ -367,12 +450,35 @@ def update_occupancy_grid_shadowed(lattice, points, camera, principal, fpx):
         tangential_proj = lattice.project_vector(tangential).reshape(1, -1)
         tangential_proj = tangential_proj / (np.linalg.norm(tangential_proj) * fpx)
         camera_proj, _ = lattice.project(camera)
-        subspace = Subspace.from_components(tangential_proj, principal_proj)
+        subspace = Subspace.from_components(tangential_proj, principal_proj, camera_proj)
         line = depth_transform(indices, subspace, method="perspective")
         mask = line.arr != np.inf
         shadow = line.deproject(line.indices()[mask], line.arr.reshape(-1, 1)[mask], method="perspective")
         shadow = lattice.filter(lattice.round(shadow))
+        lattice_points = np.array(np.where(lattice.arr)).transpose()
+        lattice_points = filter_occluded(lattice_points, line, method="perspective")
+        lattice.arr[:] = 0
+        lattice[lattice_points] = 1
         lattice[shadow] = 1
+
+def filter_occluded(points, depth_lattice, method="orthogonal"):
+    indices, depths = depth_lattice.project(points, method=method)
+    indices = depth_lattice.round(indices)
+    within_fov = depth_lattice.argfilter(indices)
+    within_fov_points = points[within_fov]
+    within_fov_indices = indices[within_fov]
+    within_fov_points_depths = depths[within_fov].reshape(-1)
+    within_fov_ref_depths = depth_lattice[within_fov_indices]
+    valid_within_fov = (within_fov_points_depths > within_fov_ref_depths) \
+        | (within_fov_points_depths < 0)
+    valid_within_fov_points = within_fov_points[valid_within_fov]
+    outside_fov_points = points[~within_fov]
+    if len(valid_within_fov_points) == 0:
+        return outside_fov_points
+    elif len(outside_fov_points) == 0:
+        return valid_within_fov_points
+    else:
+        return np.vstack([valid_within_fov_points, outside_fov_points])
 
 def normed_convolution(array, kernel):
     """

@@ -3,6 +3,7 @@ import numpy as np
 import transformation
 import mapping
 import cv2
+import skimage.morphology
 import skfmm
 import numpy.ma as npmask
 import lcmutils
@@ -13,11 +14,31 @@ import threading
 import json
 import optparse
 
-def barrier_force(distance):
-    return -10 * distance
+def compute_potential(obstacle_map, goal_map, dilation=30):
+    selem = np.ones((dilation, dilation))
+    mask = skimage.morphology.binary_dilation(obstacle_map, selem=selem).astype("bool")
+    scene = npmask.array(goal_map, mask=mask)
+    potential_map = skfmm.distance(scene)
+    potential_map[mask] = np.inf
+    return potential_map
 
-def goal_force(distance):
-    return distance
+def compute_gradient(potential_map, ij):
+    ij = ij.reshape(-1)
+    ij_min = None
+    potential_min = np.inf
+    for di in range(-2, 3):
+        i = ij[0] + di
+        if i >= 0 and i < potential_map.shape[0]:
+            for dj in range(-2, 3):
+                j = ij[1] + dj
+                if j >= 0 and j < potential_map.shape[1] and (di != 0 or dj != 0):
+                    if potential_map[i, j] < potential_min:
+                        ij_min = np.array([i, j])
+                        potential_min = potential_map[i, j]
+    if ij_min is None:
+        return np.array([np.nan, np.nan])
+    else:
+        return (ij_min - ij) / np.linalg.norm(ij_min - ij)
 
 def compute_force(potential_map, scale, ij):
     ij = ij.reshape(-1)
@@ -59,80 +80,115 @@ if __name__ == "__main__":
         config = json.load(f)
 
     # Construct an empty lattice to hold the occupancy grid of the environment
-    delta = 0.02
+    delta = 0.03
     basis = delta * np.array([[1, 0, 0], [0, 1, 0]])
     normal = np.array([[0, 0, 1]])
     origin = np.array([-5, -5, 0])
     subspace = mapping.Subspace.from_components(basis, normal, origin)
-    arr = np.zeros((int(10 / delta), int(10 / delta)), dtype="uint8")
-    lattice = mapping.Lattice(arr, subspace)
+    jumpable_arr = np.zeros((int(10 / delta), int(10 / delta)), dtype="int")
+    unjumpable_arr = np.zeros((int(10 / delta), int(10 / delta)), dtype="int")
+    jumpable_lattice = mapping.Lattice(jumpable_arr, subspace)
+    unjumpable_lattice = mapping.Lattice(unjumpable_arr, subspace)
 
     # Create a goal map to store where the goal point is
-    goal_map = np.ones_like(arr, dtype="float")
+    goal_map = np.ones_like(jumpable_arr, dtype="float")
+    goal = np.array([ 3.97090387, -0.89732879, -0.19225973])
+    goal_proj, _ = subspace.project(goal)
+    goal_map[tuple(goal_proj.astype("int"))] = 0
 
     # Store the current pose for visualization purposes
+    rgb = None
     pose = None
+
+    arrow_length = int(15 * 0.02 / delta)
+    circle_radius = int(7 * 0.02 / delta)
+    cheetah_radius = 1.2
+    cheetah_radius_px = int(cheetah_radius / delta)
 
     # If visualization is turned on, enable clicking on the image to change where the goal
     # point is
-    if options.visualize:
-        def grid_click(event, x, y, flags, param):
-            if event == cv2.EVENT_LBUTTONUP:
-                i = y
-                j = x - lattice.arr.shape[0]
-                goal_map[:] = 1
-                goal_map[i,j] = 0
-        cv2.namedWindow("grid")
-        cv2.setMouseCallback("grid", grid_click)
+    # if options.visualize:
+    #     def grid_click(event, x, y, flags, param):
+    #         if event == cv2.EVENT_LBUTTONUP:
+    #             i = y
+    #             j = x - jumpable_lattice.arr.shape[0]
+    #             goal_map[:] = 1
+    #             goal_map[i,j] = 0
+    #     cv2.namedWindow("grid")
+    #     cv2.setMouseCallback("grid", grid_click)
 
     # Handle incoming pointclouds and pose over LCM by updating the occupancy grid with
     # the new points
-    def input_handler(msg_pointcloud, msg_pose):
+    def input_handler(msg_pointcloud, msg_pose, msg_image):
         global pose
+        global rgb
+        rgb_shape = (msg_image.height, msg_image.width, 3)
+        rgb = np.frombuffer(msg_image.data, "uint8").reshape(rgb_shape)
         pose_array = np.array(msg_pose.orientation + msg_pose.position)
         pose = transformation.from_array(pose_array)
         points = np.array(msg_pointcloud.points).reshape(int(msg_pointcloud.n / 3), 3)
         points = pose * points
         camera = pose.t
         principal = pose * np.array([[1, 0, 0]]) - camera
-        mapping.update_occupancy_grid(lattice, points) #, camera, principal, config["fx"])
+        jumpable_indices, _ = mapping.filter_indices(subspace, points, camera, principal, hthresh=0)
+        unjumpable_indices, _ = mapping.filter_indices(subspace, points, camera, principal, hthresh=-0.1)
+        mapping.update_occupancy_grid(jumpable_lattice, jumpable_indices)
+        mapping.update_occupancy_grid(unjumpable_lattice, unjumpable_indices)
     
     # Recompute potential function and show visualization of the environment
     running = True
     def planner():
         global running
+        frames = []
         while running:
             if pose is not None:
-                # Compute the potential function for a given goal
-                try:
-                    mask = lattice.arr.astype("bool")
-                    scene = npmask.array(goal_map, mask=mask)
-                    goal_potential = goal_force(skfmm.distance(scene))
-                    barrier_potential = barrier_force(skfmm.distance(lattice.arr.astype("float")))
-                    potential_map = goal_potential + barrier_potential
-                except ValueError:
-                    potential_map = None
+                jumpable_potential = compute_potential(jumpable_lattice.arr, goal_map, dilation=cheetah_radius_px)
+                unjumpable_potential = compute_potential(unjumpable_lattice.arr, goal_map, dilation=cheetah_radius_px)
+
+                camera = pose.t
+                camera_proj, _ = subspace.project(camera)
+                jumpable_gradient = compute_gradient(jumpable_potential, camera_proj.astype("int"))
+                unjumpable_gradient = compute_gradient(unjumpable_potential, camera_proj.astype("int"))
                 
                 # If visualization is turned on, show the occupancy grid, potential
                 # function, and current position and orientation of the robot
                 if options.visualize:
-                    if potential_map is None:
-                        img = 255 * lattice.arr
+                    img = (128 * unjumpable_lattice.arr + 127 * jumpable_lattice.arr).astype("uint8")
+                    img = np.dstack((img, img, img))
+                    principal = pose * np.array([1, 0, 0]) - camera
+                    principal_proj = subspace.project_vector(principal)
+                    principal_proj = principal_proj / np.linalg.norm(principal_proj)
+                    
+                    camera_origin = tuple(camera_proj[::-1].astype("int"))
+                    camera_end = tuple((camera_proj + arrow_length * principal_proj)[::-1].astype("int"))
+                    cv2.arrowedLine(img, camera_origin, camera_end, (255, 255, 255), 1)
+
+                    cv2.circle(img, tuple(goal_proj[::-1].astype("int")), circle_radius, (0, 0, 128), -1)
+
+                    rgb_shape = (int(img.shape[0] * (rgb.shape[1] / rgb.shape[0])), int(img.shape[0]))
+                    rgb_reshaped = cv2.resize(rgb, rgb_shape)
+
+                    if not (np.any(np.isnan(jumpable_gradient)) or np.any(np.isnan(unjumpable_gradient))):
+                        desired_end = tuple((camera_proj + arrow_length * jumpable_gradient)[::-1].astype("int"))
+                        cv2.arrowedLine(img, camera_origin, desired_end, (0, 128, 0), 1)
+                        # img = np.dstack([img[::-1,::-1], img[::-1,::-1], img[::-1,::-1]])
+                        img = np.hstack((img[::-1,::-1,:], rgb_reshaped[::-1,::-1]))
+                        if np.any(jumpable_gradient != unjumpable_gradient):
+                            cv2.putText(img, "[JUMP]", (25, 15), cv2.FONT_HERSHEY_PLAIN, 0.8, 128, 2)
                     else:
-                        img = (255 / (potential_map.max() - potential_map.min()) * (potential_map.astype("float") - potential_map.min())).astype("uint8")
-                    camera, _ = lattice.project(pose * np.array([[0, 0, 0], [1, 0, 0]]))
-                    camera[1] = camera[0] + 15 * (camera[1] - camera[0]) / np.linalg.norm(camera[1] - camera[0])
-                    camera_origin = tuple(camera[0,::-1].astype("int"))
-                    camera_end = tuple(camera[1,::-1].astype("int"))
-                    cv2.arrowedLine(img, camera_origin, camera_end, 255, 1)
+                        # img = np.dstack([img[::-1,::-1], img[::-1,::-1], img[::-1,::-1]])
+                        img = np.hstack((img[::-1,::-1,:], rgb_reshaped[::-1,::-1]))
+
+                    frames.append(img)
                     cv2.imshow("grid", img)
                     if cv2.waitKey(1) == ord("q"):
+                        np.save("data/frames.npy", np.array(frames))
                         running = False
     
     # Subscribe to the pointcloud and pose channels in a synchronized way (handled by
     # "input_handler")
-    lcmutils.subscribe_sync_exact(node, [options.pointcloud, options.pose],
-        [pointcloud_t, pose_t], input_handler, verbose=True)
+    lcmutils.subscribe_sync_exact(node, [options.pointcloud, options.pose, "REALSENSE_IMAGE"],
+        [pointcloud_t, pose_t, image_t], input_handler, verbose=True)
     
     # Run the planner thread (handled by "planner")
     planner_thread = threading.Thread(target=planner)
