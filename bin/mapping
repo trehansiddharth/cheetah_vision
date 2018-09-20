@@ -185,17 +185,27 @@ if __name__ == "__main__":
                         np.save("data/frames.npy", np.array(frames))
                         running = False
     
+    # Constantly handle incoming LCM messages to update map
+    def updater():
+        global running
+        while running:
+            node.handle()
+    
     # Subscribe to the pointcloud and pose channels in a synchronized way (handled by
     # "input_handler")
     lcmutils.subscribe_sync_exact(node, [options.pointcloud, options.pose, "REALSENSE_IMAGE"],
         [pointcloud_t, pose_t, image_t], input_handler, verbose=True)
     
     # Run the planner thread (handled by "planner")
-    planner_thread = threading.Thread(target=planner)
-    planner_thread.setDaemon(True)
-    planner_thread.start()
+    # planner_thread = threading.Thread(target=planner)
+    # planner_thread.setDaemon(True)
+    # planner_thread.start()
+
+    # Run the updater thread (handled by "updater")
+    updater_thread = threading.Thread(target=updater)
+    updater_thread.setDaemon(true)
+    updater_thread.start()
 
     # Run the LCM node to constantly handle new incoming messages
-    while running:
-        node.handle()
+    planner()
 
