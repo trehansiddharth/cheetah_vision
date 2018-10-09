@@ -85,10 +85,16 @@ if __name__ == "__main__":
     normal = np.array([[0, 0, 1]])
     origin = np.array([-5, -5, 0])
     subspace = mapping.Subspace.from_components(basis, normal, origin)
-    jumpable_arr = np.zeros((int(10 / delta), int(10 / delta)), dtype="int")
-    unjumpable_arr = np.zeros((int(10 / delta), int(10 / delta)), dtype="int")
-    jumpable_lattice = mapping.Lattice(jumpable_arr, subspace)
-    unjumpable_lattice = mapping.Lattice(unjumpable_arr, subspace)
+
+    arr = np.zeros((int(10 / delta), int(10 / delta)), dtype="float")
+    heightmap_lattice = mapping.Lattice(arr.copy(), subspace)
+    slopemap_lattice = mapping.Lattice(arr.copy(), subspace)
+    unsteppable_lattice = mapping.Lattice(arr.copy(), subspace)
+    unpassable_lattice =mapping.Lattice(arr.copy(), subspace)
+
+    max_slope = 45 # degrees
+    passable_height = 0.3
+    step_length = 0.2
 
     # Create a goal map to store where the goal point is
     goal_map = np.ones_like(jumpable_arr, dtype="float")
@@ -130,31 +136,33 @@ if __name__ == "__main__":
         points = pose * points
         camera = pose.t
         principal = pose * np.array([[1, 0, 0]]) - camera
-        jumpable_indices, _ = mapping.filter_indices(subspace, points, camera, principal, hthresh=0)
-        unjumpable_indices, _ = mapping.filter_indices(subspace, points, camera, principal, hthresh=-0.1)
-        mapping.update_occupancy_grid(jumpable_lattice, jumpable_indices)
-        mapping.update_occupancy_grid(unjumpable_lattice, unjumpable_indices)
+
+        height_indices, heights = mapping.filter_indices(subspace, points, camera, principal, hthresh=-np.inf)
+        mapping.update_heightmap(heightmap_lattice, height_indices, heights)
+        mapping.update_slopemap(heightmap_lattice, slopemap_lattice)
+        mapping.update_unsteppable(unsteppable_lattice, slopemap_lattice, delta, max_slope)
+        mapping.update_unpassable(unpassable_lattice, unsteppable_lattice, slopemap_lattice, passable_height, np.int(step_length/delta))
     
     # Recompute potential function and show visualization of the environment
     running = True
     def planner():
         global running
-        frames = []
         while running:
             if pose is not None:
-                jumpable_potential = compute_potential(jumpable_lattice.arr, goal_map, dilation=cheetah_radius_px)
-                unjumpable_potential = compute_potential(unjumpable_lattice.arr, goal_map, dilation=cheetah_radius_px)
-
                 camera = pose.t
                 camera_proj, _ = subspace.project(camera)
-                jumpable_gradient = compute_gradient(jumpable_potential, camera_proj.astype("int"))
-                unjumpable_gradient = compute_gradient(unjumpable_potential, camera_proj.astype("int"))
-                
+
                 # If visualization is turned on, show the occupancy grid, potential
                 # function, and current position and orientation of the robot
                 if options.visualize:
-                    img = (128 * unjumpable_lattice.arr + 127 * jumpable_lattice.arr).astype("uint8")
-                    img = np.dstack((img, img, img))
+                    unpassable_img = 255 * unpassable_lattice.arr.astype("uint8")
+                    unsteppable_logical = unsteppable_lattice.arr & (~unpassable_lattice.arr)
+                    unsteppable_img = 255 * unsteppable_logical.astype("uint8")
+                    seen_logical = heightmap_lattice.arr.astype("bool") & ~(unpassable_lattice.arr | unsteppable_logical)
+                    seen_img = 255 * seen_logical.astype("uint8")
+                   
+                    img = np.dstack((unsteppable_img, seen_img, unpassable_img))
+
                     principal = pose * np.array([1, 0, 0]) - camera
                     principal_proj = subspace.project_vector(principal)
                     principal_proj = principal_proj / np.linalg.norm(principal_proj)
@@ -168,21 +176,9 @@ if __name__ == "__main__":
                     rgb_shape = (int(img.shape[0] * (rgb.shape[1] / rgb.shape[0])), int(img.shape[0]))
                     rgb_reshaped = cv2.resize(rgb, rgb_shape)
 
-                    if not (np.any(np.isnan(jumpable_gradient)) or np.any(np.isnan(unjumpable_gradient))):
-                        desired_end = tuple((camera_proj + arrow_length * jumpable_gradient)[::-1].astype("int"))
-                        cv2.arrowedLine(img, camera_origin, desired_end, (0, 128, 0), 1)
-                        # img = np.dstack([img[::-1,::-1], img[::-1,::-1], img[::-1,::-1]])
-                        img = np.hstack((img[::-1,::-1,:], rgb_reshaped[::-1,::-1]))
-                        if np.any(jumpable_gradient != unjumpable_gradient):
-                            cv2.putText(img, "[JUMP]", (25, 15), cv2.FONT_HERSHEY_PLAIN, 0.8, 128, 2)
-                    else:
-                        # img = np.dstack([img[::-1,::-1], img[::-1,::-1], img[::-1,::-1]])
-                        img = np.hstack((img[::-1,::-1,:], rgb_reshaped[::-1,::-1]))
-
-                    frames.append(img)
+                    img = cv2.resize(img,(4*width, 4*height), interpolation = cv2.INTER_CUBIC)
                     cv2.imshow("grid", img)
                     if cv2.waitKey(1) == ord("q"):
-                        np.save("data/frames.npy", np.array(frames))
                         running = False
     
     # Constantly handle incoming LCM messages to update map
@@ -203,7 +199,7 @@ if __name__ == "__main__":
 
     # Run the updater thread (handled by "updater")
     updater_thread = threading.Thread(target=updater)
-    updater_thread.setDaemon(true)
+    updater_thread.setDaemon(True)
     updater_thread.start()
 
     # Run the LCM node to constantly handle new incoming messages
