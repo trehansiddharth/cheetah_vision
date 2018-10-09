@@ -97,7 +97,7 @@ if __name__ == "__main__":
     step_length = 0.2
 
     # Create a goal map to store where the goal point is
-    goal_map = np.ones_like(jumpable_arr, dtype="float")
+    goal_map = np.ones_like(arr, dtype="float")
     goal = np.array([ 3.97090387, -0.89732879, -0.19225973])
     goal_proj, _ = subspace.project(goal)
     goal_map[tuple(goal_proj.astype("int"))] = 0
@@ -156,9 +156,9 @@ if __name__ == "__main__":
                 # function, and current position and orientation of the robot
                 if options.visualize:
                     unpassable_img = 255 * unpassable_lattice.arr.astype("uint8")
-                    unsteppable_logical = unsteppable_lattice.arr & (~unpassable_lattice.arr)
+                    unsteppable_logical = unsteppable_lattice.arr.astype("bool") & (~unpassable_lattice.arr.astype("bool"))
                     unsteppable_img = 255 * unsteppable_logical.astype("uint8")
-                    seen_logical = heightmap_lattice.arr.astype("bool") & ~(unpassable_lattice.arr | unsteppable_logical)
+                    seen_logical = heightmap_lattice.arr.astype("bool") & ~(unpassable_lattice.arr.astype("bool") | unsteppable_logical.astype("bool"))
                     seen_img = 255 * seen_logical.astype("uint8")
                    
                     img = np.dstack((unsteppable_img, seen_img, unpassable_img))
@@ -176,6 +176,7 @@ if __name__ == "__main__":
                     rgb_shape = (int(img.shape[0] * (rgb.shape[1] / rgb.shape[0])), int(img.shape[0]))
                     rgb_reshaped = cv2.resize(rgb, rgb_shape)
 
+                    height, width = img.shape[:2]
                     img = cv2.resize(img,(4*width, 4*height), interpolation = cv2.INTER_CUBIC)
                     cv2.imshow("grid", img)
                     if cv2.waitKey(1) == ord("q"):
