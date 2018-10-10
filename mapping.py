@@ -400,7 +400,7 @@ def update_slopemap(heightmap_lattice, slopemap_lattice):
             array represents the maximum center difference of the heights of the adjacent cells
     """
     dx, dy = np.gradient(heightmap_lattice.arr)
-    slopemap_lattice[slopemap_lattice.indices()] = np.maximum(dx,dy).astype("float").reshape(-1)
+    slopemap_lattice.arr = np.maximum(dx,dy).astype("float")
 
 def update_unsteppable(unsteppable_lattice, slopemap_lattice, delta, max_slope):
     """
@@ -415,7 +415,7 @@ def update_unsteppable(unsteppable_lattice, slopemap_lattice, delta, max_slope):
         max_slope: steepest angle we can step on
     """
     slope_threshold = 2*delta*np.tan(np.deg2rad(max_slope))
-    unsteppable_lattice[unsteppable_lattice.indices()] = ((slopemap_lattice.arr > slope_threshold)*np.ones_like(slopemap_lattice.arr)).reshape(-1)
+    unsteppable_lattice.arr = (slopemap_lattice.arr > slope_threshold)*np.ones_like(slopemap_lattice.arr)
 
 def update_unpassable(unpassable_lattice, unsteppable_lattice, slopemap_lattice, passable_height, kernel_size):
     """
@@ -433,7 +433,6 @@ def update_unpassable(unpassable_lattice, unsteppable_lattice, slopemap_lattice,
     unpassable_lattice.arr = np.logical_or(unpassable_lattice.arr, (slopemap_lattice.arr > passable_height))
     unpassable_lattice.arr = np.logical_or(unpassable_lattice.arr, cv2.morphologyEx(unsteppable_lattice.arr,
         cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(kernel_size,kernel_size))))
-    unpassable_lattice[unpassable_lattice.indices()] = unpassable_lattice.arr.reshape(-1)
 
 def filter_indices(subspace, points, camera, principal, hthresh=0, dthresh=3, cthresh=4):
     """
