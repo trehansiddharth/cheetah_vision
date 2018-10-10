@@ -1,4 +1,4 @@
-package cheetahlcm;
+package lcm_types;
 
 struct state_estimate_t
 {
