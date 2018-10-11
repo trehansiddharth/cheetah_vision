@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import realsense
 import numpy as np
+import cv2.aruco
 import lcmutils
 from lcm_types.pose_t import pose_t
 from lcm_types.pointcloud_t import pointcloud_t
@@ -8,7 +9,48 @@ from lcm_types.image_t import image_t
 from lcm_types.state_estimate_t import state_estimate_t
 import transformation
 import quaternion
+import json 
 import optparse
+
+def rgb_to_gray(rgb, filt=[0.299, 0.587, 0.114]):
+    return np.dot(rgb[...,:3], filt).astype("uint8")
+
+def detect_aruco(gray):
+    aruco_dict = cv2.aruco.Dictionary_get(cv2.aruco.DICT_6X6_250)
+    parameters =  cv2.aruco.DetectorParameters_create()
+    corners, ids, rejectedImgPoints = cv2.aruco.detectMarkers(gray, aruco_dict, parameters=parameters)
+    corners = np.squeeze(np.array(corners)).reshape(-1, 4, 2)[:,:,::-1].astype("int")
+    # criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+    # corners = cv2.cornerSubPix(gray,corners,(5,5),(-1,-1),criteria)
+    return corners, ids
+
+def array_lookup(arr, ixs):
+    return arr[tuple(np.moveaxis(ixs, -1, 0))]
+
+def rigid_transform_3D(A, B):
+    N = A.shape[0]
+
+    centroid_A = np.mean(A, axis=0)
+    centroid_B = np.mean(B, axis=0)
+
+    # center the points
+    AA = A - np.tile(centroid_A, (N, 1))
+    BB = B - np.tile(centroid_B, (N, 1))
+
+    # dot is matrix multiplication for array
+    H = np.matmul(AA.transpose(), BB)
+
+    U, S, Vt = np.linalg.svd(H)
+
+    R = Vt.transpose() @ U.transpose()
+
+    if np.linalg.det(R) < 0:
+        Vt[2,:] *= -1
+        R = Vt.transpose() @ U.transpose()
+
+    t = -R @ centroid_A.transpose() + centroid_B.transpose()
+
+    return np.hstack((R, t.reshape(3, 1)))
 
 if __name__ == "__main__":
     help_text = ("Connects to the Realsense camera with librealsense2 API, runs visual "
@@ -42,18 +84,28 @@ if __name__ == "__main__":
                 t = np.array(msg.p0))
 
         cheetah_subscription = lcmutils.subscribe(node, "CHEETAH_state_estimate", state_estimate_t, cheetah_callback, verbose=False)
+    
+    with open(options.config) as f:
+        config = json.load(f)
+    
+    ref_points_3d = np.array([[0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [1.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0]])
 
     camera = realsense.RealsenseCamera(options.config, options.vocabulary)
     camera.initialize()
     pose = None
     while pose is None:
-        timestamp, pose, points, color = camera.get_scene()
+        timestamp, pose, pointframe, color = camera.get_scene()
     if not options.debug:
         node.handle()
         realsense_ref = cheetah_T * pose.change_basis(realsense_basis).inverse()
         lcmutils.unsubscribe(node, cheetah_subscription)
     while True:
-        timestamp, pose, points, color = camera.get_scene()
+        timestamp, pose, pointframe, color = camera.get_scene()
+        points = pointframe.reshape(-1, 3)
+        points = points[np.where(np.any(points, axis=1))]
         if pose is not None:
             if options.debug:
                 realsense_T = pose.change_basis(realsense_basis)
@@ -71,6 +123,31 @@ if __name__ == "__main__":
                 msg.n = points.size
                 msg.points = (realsense_basis * points).astype("float32").reshape(-1)
                 node.publish(options.pointcloud, msg.encode())
+            if color is not None:
+                corners, ids = detect_aruco(rgb_to_gray(color))
+
+                if ids is not None:
+                    corners_3d = array_lookup(pointframe, corners.astype("int"))
+                    for marker in config["markers"]:
+                        marker_id = marker["id"]
+                        channel = marker["channel"]
+                        size = marker["size"]
+                        ixs, _ = np.where(ids == marker_id)
+                        if ixs.size == 0:
+                            pass
+                        elif ixs.size == 1:
+                            marker_points_3d = corners_3d[ixs[0]]
+                            if np.all(np.any(marker_points_3d, axis=1)):
+                                pose = rigid_transform_3D(size * ref_points_3d, marker_points_3d)
+                                reprojected_points_3d = size * ref_points_3d @ pose[:,:3].transpose() + pose[:,3:].transpose()
+                                msg_pose = pose_t()
+                                msg_pose.timestamp = timestamp
+                                arr = transformation.from_pose_matrix(pose).as_array().astype("float32")
+                                msg_pose.orientation= arr[:4]
+                                msg_pose.position = arr[4:]
+                                node.publish(channel, msg_pose.encode())
+                        else:
+                            print("ERR: multiple tags of id %i in field of view" % marker_id)
         if color is not None:
             msg = image_t()
             msg.timestamp = timestamp

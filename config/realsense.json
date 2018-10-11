@@ -14,5 +14,12 @@
     "bf" : 17.2218,
     "thdepth" : 15,
     "nfeatures" : 1000,
-    "delay" : 0.0
+    "delay" : 0.0,
+    "markers" : [
+        {
+            "id" : 2,
+            "size" : 0.0500,
+            "channel" : "ARUCO_POSE"
+        }
+    ]
 }

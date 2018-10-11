@@ -62,8 +62,7 @@ class RealsenseCamera:
         t = time.time() - self.parameters["delay"]
         pose = np.array(self.slam.update(frameset.color, frameset.depth, t))
         color = np.array(frameset.color).astype("uint8")
-        points = np.array(frameset.vertices).reshape(-1, 3)
-        points = points[np.where(np.any(points, axis=1))]
+        points = np.array(frameset.vertices).reshape(color.shape)
 
         if pose.size == 1:
             return t, None, points, color
