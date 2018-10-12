@@ -1,6 +1,7 @@
 import numpy as np
 import scipy.ndimage
 import cv2
+import time
 
 class Subspace:
     """
@@ -377,7 +378,11 @@ def update_heightmap(lattice, indices, heights):
             be projected onto that position.
         points: (p, k) np.array: Points in the k-dimensional superspace to update the
             heightmap with.
+
+    Returns:
+        indices: List: min x index, max x index, min y index, max y index
     """
+
     heights = heights.reshape(-1)
     mask = lattice.argfilter(indices)
     heights = heights[mask]
@@ -386,9 +391,12 @@ def update_heightmap(lattice, indices, heights):
     sort = np.argsort(heights)
     heights = heights[sort]
     indices = indices[sort].astype("int")
+
     lattice[indices] = heights
 
-def update_slopemap(heightmap_lattice, slopemap_lattice):
+    return min(indices[:,0]), max(indices[:,0]), min(indices[:,1]), max(indices[:,1])
+
+def update_slopemap(heightmap_lattice, slopemap_lattice, indices):
     """
     Updates an existing slopemap using a heightmap
 
@@ -398,11 +406,13 @@ def update_slopemap(heightmap_lattice, slopemap_lattice):
             be projected onto that position.
         slopemap_lattice: Lattice: A lattice on an n-dimensional subspace where each value in the
             array represents the maximum center difference of the heights of the adjacent cells
+        indices: List: min x index, max x index, min y index, max y index
     """
-    dx, dy = np.gradient(heightmap_lattice.arr)
-    slopemap_lattice.arr = np.maximum(dx,dy).astype("float")
+    minx, maxx, miny, maxy = indices
+    dx, dy = np.gradient(heightmap_lattice.arr[minx:maxx, miny:maxy])
+    slopemap_lattice.arr[minx:maxx, miny:maxy] = np.maximum(dx,dy).astype("float")
 
-def update_unsteppable(unsteppable_lattice, slopemap_lattice, delta, max_slope):
+def update_unsteppable(unsteppable_lattice, slopemap_lattice, delta, max_slope, indices):
     """
     Updates existing unsteppable lattice using a slopemap
 
@@ -413,11 +423,13 @@ def update_unsteppable(unsteppable_lattice, slopemap_lattice, delta, max_slope):
             array represents the maximum center difference of the heights of the adjacent cells
         delta: grid square size in cm
         max_slope: steepest angle we can step on
+        indices: List: min x index, max x index, min y index, max y index
     """
+    minx, maxx, miny, maxy = indices
     slope_threshold = 2*delta*np.tan(np.deg2rad(max_slope))
-    unsteppable_lattice.arr = (slopemap_lattice.arr > slope_threshold)*np.ones_like(slopemap_lattice.arr)
+    unsteppable_lattice.arr[minx:maxx, miny:maxy] = (slopemap_lattice.arr[minx:maxx, miny:maxy] > slope_threshold)*np.ones_like(slopemap_lattice.arr[minx:maxx, miny:maxy])
 
-def update_unpassable(unpassable_lattice, unsteppable_lattice, slopemap_lattice, passable_height, kernel_size):
+def update_unpassable(unpassable_lattice, unsteppable_lattice, slopemap_lattice, passable_height, kernel_size, indices):
     """
     Updates existing unsteppable lattice using a slopemap
 
@@ -429,9 +441,11 @@ def update_unpassable(unpassable_lattice, unsteppable_lattice, slopemap_lattice,
         slopemap_lattice: Lattice: A lattice on an n-dimensional subspace where each value in the
             array represents the maximum center difference of the heights of the adjacent cells
         passable_height: the maximum height difference that can be passed 
+        indices: List: min x index, max x index, min y index, max y index
     """
-    unpassable_lattice.arr = np.logical_or(unpassable_lattice.arr, (slopemap_lattice.arr > passable_height))
-    unpassable_lattice.arr = np.logical_or(unpassable_lattice.arr, cv2.morphologyEx(unsteppable_lattice.arr,
+    minx, maxx, miny, maxy = indices
+    unpassable_lattice.arr[minx:maxx, miny:maxy] = np.logical_or(unpassable_lattice.arr[minx:maxx, miny:maxy], (slopemap_lattice.arr[minx:maxx, miny:maxy] > passable_height))
+    unpassable_lattice.arr[minx:maxx, miny:maxy] = np.logical_or(unpassable_lattice.arr[minx:maxx, miny:maxy], cv2.morphologyEx(unsteppable_lattice.arr[minx:maxx, miny:maxy],
         cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(kernel_size,kernel_size))))
 
 def filter_indices(subspace, points, camera, principal, hthresh=0, dthresh=3, cthresh=4):

@@ -5,6 +5,7 @@ import mapping
 import cv2
 import skimage.morphology
 import skfmm
+import time
 import numpy.ma as npmask
 import lcmutils
 from lcm_types.pose_t import pose_t
@@ -91,6 +92,7 @@ if __name__ == "__main__":
     slopemap_lattice = mapping.Lattice(arr.copy(), subspace)
     unsteppable_lattice = mapping.Lattice(arr.copy(), subspace)
     unpassable_lattice =mapping.Lattice(arr.copy(), subspace)
+    print(arr.shape)
 
     max_slope = 45 # degrees
     passable_height = 0.3
@@ -128,6 +130,7 @@ if __name__ == "__main__":
     def input_handler(msg_pointcloud, msg_pose, msg_image):
         global pose
         global rgb
+
         rgb_shape = (msg_image.height, msg_image.width, 3)
         rgb = np.frombuffer(msg_image.data, "uint8").reshape(rgb_shape)
         pose_array = np.array(msg_pose.orientation + msg_pose.position)
@@ -138,16 +141,52 @@ if __name__ == "__main__":
         principal = pose * np.array([[1, 0, 0]]) - camera
 
         height_indices, heights = mapping.filter_indices(subspace, points, camera, principal, hthresh=-np.inf)
-        mapping.update_heightmap(heightmap_lattice, height_indices, heights)
-        mapping.update_slopemap(heightmap_lattice, slopemap_lattice)
-        mapping.update_unsteppable(unsteppable_lattice, slopemap_lattice, delta, max_slope)
-        mapping.update_unpassable(unpassable_lattice, unsteppable_lattice, slopemap_lattice, passable_height, np.int(step_length/delta))
-    
+        indices = mapping.update_heightmap(heightmap_lattice, height_indices, heights)
+
+        mapping.update_slopemap(heightmap_lattice, slopemap_lattice, indices)
+
+        mapping.update_unsteppable(unsteppable_lattice, slopemap_lattice, delta, max_slope, indices)
+
+        mapping.update_unpassable(unpassable_lattice, unsteppable_lattice, slopemap_lattice, passable_height, np.int(step_length/delta), indices)
+
+        unsteppable_logical = unsteppable_lattice.arr.astype("bool") & (~unpassable_lattice.arr.astype("bool"))
+        seen_logical = heightmap_lattice.arr.astype("bool") & ~(unpassable_lattice.arr.astype("bool") | unsteppable_logical.astype("bool"))
+
+        camera_proj, _ = subspace.project(camera)
+        # If visualization is turned on, show the occupancy grid, potential
+        # function, and current position and orientation of the robot
+        if options.visualize:
+            unpassable_img = 255 * unpassable_lattice.arr.astype("uint8")
+            unsteppable_img = 255 * unsteppable_logical.astype("uint8")
+            seen_img = 255 * seen_logical.astype("uint8")
+            img = np.dstack((unsteppable_img, seen_img, unpassable_img))
+
+            principal_proj = subspace.project_vector(principal)
+            principal_proj = principal_proj / np.linalg.norm(principal_proj)
+               
+            camera_origin = tuple(camera_proj[::-1].astype("int"))
+            camera_end = tuple((camera_proj + arrow_length * principal_proj)[::-1].astype("int"))
+            cv2.arrowedLine(img, camera_origin, camera_end, (255, 255, 255), 1)
+
+            cv2.circle(img, tuple(goal_proj[::-1].astype("int")), circle_radius, (0, 0, 128), -1)
+
+            rgb_shape = (int(img.shape[0] * (rgb.shape[1] / rgb.shape[0])), int(img.shape[0]))
+            rgb_reshaped = cv2.resize(rgb, rgb_shape)
+
+            height, width = img.shape[:2]
+            img = cv2.resize(img,(4*width, 4*height), interpolation = cv2.INTER_CUBIC)
+            cv2.imshow("grid", img)
+
+            if cv2.waitKey(1) == ord("q"):
+                running = False
+        # print("visualization time", time.time()-start)
+
     # Recompute potential function and show visualization of the environment
     running = True
     def planner():
         global running
         while running:
+        	# continue
             if pose is not None:
                 camera = pose.t
                 camera_proj, _ = subspace.project(camera)
@@ -199,10 +238,12 @@ if __name__ == "__main__":
     # planner_thread.start()
 
     # Run the updater thread (handled by "updater")
-    updater_thread = threading.Thread(target=updater)
-    updater_thread.setDaemon(True)
-    updater_thread.start()
+    # updater_thread = threading.Thread(target=updater)
+    # updater_thread.setDaemon(False)
+    # updater_thread.start()
 
     # Run the LCM node to constantly handle new incoming messages
-    planner()
+    # planner()
+
+    updater()
 
