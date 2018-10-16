@@ -55,7 +55,7 @@ class RealsenseCamera:
         height = int(self.parameters["height"])
         width = int(self.parameters["width"])
         fps = int(self.parameters["fps"])
-        self.realsense = realsense2.RealsenseReader(height, width, fps)
+        self.realsense = realsense2.RealsenseReader(height, width, fps, align_color=True)
 
     def get_scene(self):
         frameset = self.realsense.get_frames()

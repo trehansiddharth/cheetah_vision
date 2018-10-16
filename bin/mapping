@@ -60,6 +60,10 @@ def compute_force(potential_map, scale, ij):
 def potential_dynamics(inertia, damping, dt, velocity, force):
     return velocity + (dt / inertia) * (force - damping * velocity)
 
+def decode_pose(msg_pose):
+    pose_array = np.array(msg_pose.orientation + msg_pose.position)
+    return msg_pose.timestamp, transformation.from_array(pose_array)
+
 if __name__ == "__main__":
     # Parse command-line arguments
     parser = optparse.OptionParser()
@@ -68,7 +72,7 @@ if __name__ == "__main__":
     parser.add_option("-c", "--config", dest="config", help="Read camera config from CONFIGFILE", metavar="CONFIGFILE")
     parser.add_option("-p", "--pose", dest="pose", help="Read pose from POSECHANNEL", metavar="POSECHANNEL", default="REALSENSE_POSE")
     parser.add_option("-t", "--pointcloud", dest="pointcloud", help="Read pointcloud from POINTCLOUDCHANNEL", metavar="POINTCLOUDCHANNEL", default="REALSENSE_POINTCLOUD")
-    parser.add_option("-m", "--map", dest="map", help="Publish map to MAPCHANNEL", metavar="MAPCHANNEL", default="INTEGRATED_MAP")
+    parser.add_option("-a", "--aruco", dest="aruco", help="Read aruco pose from ARUCOPOSECHANNEL", metavar="ARUCOPOSECHANNEL", default="ARUCO_POSE")
     parser.add_option("-v", "--visualize", dest="visualize", help="Show a visualization of integrated map", action="store_true")
 
     (options, args) = parser.parse_args()
@@ -107,34 +111,19 @@ if __name__ == "__main__":
     # Store the current pose for visualization purposes
     rgb = None
     pose = None
+    aruco_pose = None
 
     arrow_length = int(15 * 0.02 / delta)
     circle_radius = int(7 * 0.02 / delta)
     cheetah_radius = 1.2
     cheetah_radius_px = int(cheetah_radius / delta)
 
-    # If visualization is turned on, enable clicking on the image to change where the goal
-    # point is
-    # if options.visualize:
-    #     def grid_click(event, x, y, flags, param):
-    #         if event == cv2.EVENT_LBUTTONUP:
-    #             i = y
-    #             j = x - jumpable_lattice.arr.shape[0]
-    #             goal_map[:] = 1
-    #             goal_map[i,j] = 0
-    #     cv2.namedWindow("grid")
-    #     cv2.setMouseCallback("grid", grid_click)
-
     # Handle incoming pointclouds and pose over LCM by updating the occupancy grid with
     # the new points
-    def input_handler(msg_pointcloud, msg_pose, msg_image):
+    def input_handler(msg_pointcloud, msg_pose):
         global pose
-        global rgb
 
-        rgb_shape = (msg_image.height, msg_image.width, 3)
-        rgb = np.frombuffer(msg_image.data, "uint8").reshape(rgb_shape)
-        pose_array = np.array(msg_pose.orientation + msg_pose.position)
-        pose = transformation.from_array(pose_array)
+        _, pose = decode_pose(msg_pose)
         points = np.array(msg_pointcloud.points).reshape(int(msg_pointcloud.n / 3), 3)
         points = pose * points
         camera = pose.t
@@ -166,12 +155,12 @@ if __name__ == "__main__":
                
             camera_origin = tuple(camera_proj[::-1].astype("int"))
             camera_end = tuple((camera_proj + arrow_length * principal_proj)[::-1].astype("int"))
-            cv2.arrowedLine(img, camera_origin, camera_end, (255, 255, 255), 1)
+            # cv2.arrowedLine(img, camera_origin, camera_end, (255, 255, 255), 1)
 
-            cv2.circle(img, tuple(goal_proj[::-1].astype("int")), circle_radius, (0, 0, 128), -1)
-
-            rgb_shape = (int(img.shape[0] * (rgb.shape[1] / rgb.shape[0])), int(img.shape[0]))
-            rgb_reshaped = cv2.resize(rgb, rgb_shape)
+            if aruco_pose is not None:
+                ix, _ = subspace.project(aruco_pose.t.reshape(1, -1))
+                ix = tuple(ix.astype("int").reshape(-1)[::-1])
+                cv2.circle(img, ix, 2, (255, 255, 255), -1)
 
             height, width = img.shape[:2]
             img = cv2.resize(img,(4*width, 4*height), interpolation = cv2.INTER_CUBIC)
@@ -179,71 +168,21 @@ if __name__ == "__main__":
 
             if cv2.waitKey(1) == ord("q"):
                 running = False
-        # print("visualization time", time.time()-start)
-
-    # Recompute potential function and show visualization of the environment
-    running = True
-    def planner():
-        global running
-        while running:
-        	# continue
-            if pose is not None:
-                camera = pose.t
-                camera_proj, _ = subspace.project(camera)
-
-                # If visualization is turned on, show the occupancy grid, potential
-                # function, and current position and orientation of the robot
-                if options.visualize:
-                    unpassable_img = 255 * unpassable_lattice.arr.astype("uint8")
-                    unsteppable_logical = unsteppable_lattice.arr.astype("bool") & (~unpassable_lattice.arr.astype("bool"))
-                    unsteppable_img = 255 * unsteppable_logical.astype("uint8")
-                    seen_logical = heightmap_lattice.arr.astype("bool") & ~(unpassable_lattice.arr.astype("bool") | unsteppable_logical.astype("bool"))
-                    seen_img = 255 * seen_logical.astype("uint8")
-                   
-                    img = np.dstack((unsteppable_img, seen_img, unpassable_img))
-
-                    principal = pose * np.array([1, 0, 0]) - camera
-                    principal_proj = subspace.project_vector(principal)
-                    principal_proj = principal_proj / np.linalg.norm(principal_proj)
-                    
-                    camera_origin = tuple(camera_proj[::-1].astype("int"))
-                    camera_end = tuple((camera_proj + arrow_length * principal_proj)[::-1].astype("int"))
-                    cv2.arrowedLine(img, camera_origin, camera_end, (255, 255, 255), 1)
-
-                    cv2.circle(img, tuple(goal_proj[::-1].astype("int")), circle_radius, (0, 0, 128), -1)
-
-                    rgb_shape = (int(img.shape[0] * (rgb.shape[1] / rgb.shape[0])), int(img.shape[0]))
-                    rgb_reshaped = cv2.resize(rgb, rgb_shape)
-
-                    height, width = img.shape[:2]
-                    img = cv2.resize(img,(4*width, 4*height), interpolation = cv2.INTER_CUBIC)
-                    cv2.imshow("grid", img)
-                    if cv2.waitKey(1) == ord("q"):
-                        running = False
     
-    # Constantly handle incoming LCM messages to update map
-    def updater():
-        global running
-        while running:
-            node.handle()
+    def handle_aruco(msg_aruco):
+        global aruco_pose
+        _, aruco_pose_local = decode_pose(msg_aruco)
+        if pose is not None:
+            aruco_pose = pose * aruco_pose_local
     
     # Subscribe to the pointcloud and pose channels in a synchronized way (handled by
     # "input_handler")
-    lcmutils.subscribe_sync_exact(node, [options.pointcloud, options.pose, "REALSENSE_IMAGE"],
-        [pointcloud_t, pose_t, image_t], input_handler, verbose=True)
+    lcmutils.subscribe_sync_exact(node, [options.pointcloud, options.pose],
+        [pointcloud_t, pose_t], input_handler, verbose=True)
     
-    # Run the planner thread (handled by "planner")
-    # planner_thread = threading.Thread(target=planner)
-    # planner_thread.setDaemon(True)
-    # planner_thread.start()
-
-    # Run the updater thread (handled by "updater")
-    # updater_thread = threading.Thread(target=updater)
-    # updater_thread.setDaemon(False)
-    # updater_thread.start()
-
-    # Run the LCM node to constantly handle new incoming messages
-    # planner()
-
-    updater()
+    lcmutils.subscribe(node, options.aruco, pose_t, handle_aruco, verbose=True)
+    
+    # Constantly handle incoming LCM messages to update map
+    while True:
+        node.handle()
 

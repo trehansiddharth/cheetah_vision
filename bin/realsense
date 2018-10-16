@@ -142,7 +142,8 @@ if __name__ == "__main__":
                                 reprojected_points_3d = size * ref_points_3d @ pose[:,:3].transpose() + pose[:,3:].transpose()
                                 msg_pose = pose_t()
                                 msg_pose.timestamp = timestamp
-                                arr = transformation.from_pose_matrix(pose).as_array().astype("float32")
+                                aruco_transformation = realsense_basis * transformation.from_pose_matrix(pose)
+                                arr = aruco_transformation.as_array().astype("float32")
                                 msg_pose.orientation= arr[:4]
                                 msg_pose.position = arr[4:]
                                 node.publish(channel, msg_pose.encode())
